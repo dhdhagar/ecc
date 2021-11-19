@@ -91,6 +91,9 @@ def build_knn_graph(ds, k):
         edge_weights.append(wt_array[idx_gt_mask])
     edge_weights = np.concatenate(edge_weights)
 
+    logging.info('Built kNN graph with %d nodes and %d edges',
+                 g.num_vertices(), g.num_edges())
+
     return (g, edge_weights) 
 
 
@@ -111,3 +114,9 @@ if __name__ == '__main__':
     k = 100
     logging.info('Building kNN graph on tune (k=%d)', k)
     tune_graph, tune_edge_weights = build_knn_graph(tune_ds, k)
+
+    logging.info('Building average linkage HAC tree...')
+    tune_tree = hg.binary_partition_tree_average_linkage(tune_graph,
+                                                         tune_edge_weights)
+    embed()
+    exit()
