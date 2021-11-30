@@ -9,9 +9,11 @@ import collections
 import faiss
 import higra as hg
 import logging
+import numba as nb
 import numpy as np
 import scipy
 import sklearn
+import time
 
 from IPython import embed
 
@@ -32,6 +34,14 @@ def load_xcluster_tsv(infile, normalize=True):
         norms[norms == 0] = 1.0
         vecs /= norms
     return np.arange(vecs.shape[0]), vecs, lbls
+
+
+def subsample_ds(ds, approx_size=2000):
+    idxs, vecs, lbls = ds
+    ds_size = idxs.size
+    ss_percentage = approx_size / ds_size
+    subsampled_ds, _ = split_tune_test(ds, tune_percentage=ss_percentage)
+    return subsampled_ds
 
 
 def split_tune_test(ds, tune_percentage=0.5):
@@ -91,10 +101,38 @@ def build_knn_graph(ds, k):
         edge_weights.append(wt_array[idx_gt_mask])
     edge_weights = np.concatenate(edge_weights)
 
+    # [-1, 1] -> [0, 1]
+    edge_weights = (edge_weights / 2) + 0.5
+
     logging.info('Built kNN graph with %d nodes and %d edges',
                  g.num_vertices(), g.num_edges())
 
     return (g, edge_weights) 
+
+
+def rescale_edge_weights(edge_weights, threshold):
+    return np.clip(edge_weights - threshold + 0.5, 0, 1)
+
+
+@nb.njit(nogil=True, parallel=True)
+def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
+    total = 0.0
+    for i in nb.prange(num_edges):
+        s = srcs[i]
+        t = tgts[i]
+        w = edge_weights[i]
+        same_cluster = (cand_clustering[s] == cand_clustering[t])
+        if same_cluster:
+            total += (1 - w)
+        else:
+            total += w
+    return total
+        
+
+def max_agree_objective(graph, edge_weights, cand_clustering):
+    srcs, tgts = graph.edge_list()
+    return _max_agree_objective(srcs, tgts, edge_weights,
+                                cand_clustering, edge_weights.size)
 
 
 if __name__ == '__main__':
@@ -109,14 +147,26 @@ if __name__ == '__main__':
     ]
 
     ds = load_xcluster_tsv(dataset_fnames[1])
-    tune_ds, test_ds = split_tune_test(ds)
+    tiny_ds = subsample_ds(ds, approx_size=2000)
+    tune_ds, test_ds = split_tune_test(tiny_ds)
 
     k = 100
     logging.info('Building kNN graph on tune (k=%d)', k)
     tune_graph, tune_edge_weights = build_knn_graph(tune_ds, k)
 
+    # Higra expects edge weights to be distances, so we subtract similarities
+    # from 1.0 to get distances.
     logging.info('Building average linkage HAC tree...')
-    tune_tree = hg.binary_partition_tree_average_linkage(tune_graph,
-                                                         tune_edge_weights)
+    tune_tree, tune_altitudes = hg.binary_partition_tree_average_linkage(
+            tune_graph, 1.0-tune_edge_weights)
+
+    # Cut the tree at an arbitrary threshold
+    leaf_labels = hg.labelisation_horizontal_cut_from_threshold(
+            tune_tree, tune_altitudes, 0.44)
+
+    # Compute MaxAgree CC Objective Value
+    objective_value = max_agree_objective(
+            tune_graph, tune_edge_weights, leaf_labels)
+
     embed()
     exit()
