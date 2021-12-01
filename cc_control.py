@@ -12,7 +12,7 @@ import logging
 import numba as nb
 import numpy as np
 import scipy
-import sklearn
+from sklearn.metrics import adjusted_rand_score
 import time
 
 from IPython import embed
@@ -20,11 +20,15 @@ from IPython import embed
 
 def load_xcluster_tsv(infile, normalize=True):
     vecs = []
+    lbl_map = {}
     lbls = []
     with open(infile, 'r') as f:
         for i, line in enumerate(f):
             splits = line.strip().split('\t')
-            lbls.append(splits[1])
+            lbl_key = splits[1]
+            if lbl_key not in lbl_map.keys():
+                lbl_map[lbl_key] = len(lbl_map)
+            lbls.append(lbl_map[lbl_key])
             vecs.append([float(x) for x in splits[2:]])
     vecs = np.array(vecs, dtype=np.float32)
     if normalize:
@@ -119,6 +123,7 @@ def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
     total = 0.0
     for i in nb.prange(num_edges):
         s = srcs[i]
+                
         t = tgts[i]
         w = edge_weights[i]
         same_cluster = (cand_clustering[s] == cand_clustering[t])
@@ -154,19 +159,30 @@ if __name__ == '__main__':
     logging.info('Building kNN graph on tune (k=%d)', k)
     tune_graph, tune_edge_weights = build_knn_graph(tune_ds, k)
 
+    tune_edge_weights = rescale_edge_weights(tune_edge_weights, 0.6)
+
     # Higra expects edge weights to be distances, so we subtract similarities
     # from 1.0 to get distances.
     logging.info('Building average linkage HAC tree...')
-    tune_tree, tune_altitudes = hg.binary_partition_tree_average_linkage(
+    tune_tree, tune_altitudes = hg.binary_partition_tree_complete_linkage(
             tune_graph, 1.0-tune_edge_weights)
 
     # Cut the tree at an arbitrary threshold
-    leaf_labels = hg.labelisation_horizontal_cut_from_threshold(
-            tune_tree, tune_altitudes, 0.44)
+    for threshold in [0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56]:
+        cand_clustering = hg.labelisation_horizontal_cut_from_threshold(
+                tune_tree, tune_altitudes, threshold)
 
-    # Compute MaxAgree CC Objective Value
-    objective_value = max_agree_objective(
-            tune_graph, tune_edge_weights, leaf_labels)
+        # Compute MaxAgree CC Objective Value
+        objective_value = max_agree_objective(
+                tune_graph, tune_edge_weights, cand_clustering)
+
+        # Compute Adjusted Rand Index
+        _, _, gold_labels = tune_ds
+        adj_rand_idx = adjusted_rand_score(gold_labels, cand_clustering)
+
+        logging.info('Threshold: %f - Objective Value: %f - '
+                     'Adjusted Rand Index: %f', threshold, objective_value,
+                     adj_rand_idx)
 
     embed()
     exit()
