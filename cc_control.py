@@ -118,6 +118,12 @@ def rescale_edge_weights(edge_weights, threshold):
     return np.clip(edge_weights - threshold + 0.5, 0, 1)
 
 
+def max_agree_objective(graph, edge_weights, cand_clustering):
+    srcs, tgts = graph.edge_list()
+    return _max_agree_objective(srcs, tgts, edge_weights,
+                                cand_clustering, edge_weights.size)
+
+
 @nb.njit(nogil=True, parallel=True)
 def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
     total = 0.0
@@ -128,17 +134,11 @@ def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
         w = edge_weights[i]
         same_cluster = (cand_clustering[s] == cand_clustering[t])
         if same_cluster:
-            total += (1 - w)
-        else:
             total += w
+        else:
+            total += 1 - w
     return total
         
-
-def max_agree_objective(graph, edge_weights, cand_clustering):
-    srcs, tgts = graph.edge_list()
-    return _max_agree_objective(srcs, tgts, edge_weights,
-                                cand_clustering, edge_weights.size)
-
 
 if __name__ == '__main__':
 
@@ -159,16 +159,18 @@ if __name__ == '__main__':
     logging.info('Building kNN graph on tune (k=%d)', k)
     tune_graph, tune_edge_weights = build_knn_graph(tune_ds, k)
 
-    tune_edge_weights = rescale_edge_weights(tune_edge_weights, 0.6)
+    #tune_edge_weights = rescale_edge_weights(tune_edge_weights, 0.6)
+
+    
 
     # Higra expects edge weights to be distances, so we subtract similarities
     # from 1.0 to get distances.
     logging.info('Building average linkage HAC tree...')
-    tune_tree, tune_altitudes = hg.binary_partition_tree_complete_linkage(
+    tune_tree, tune_altitudes = hg.binary_partition_tree_average_linkage(
             tune_graph, 1.0-tune_edge_weights)
 
     # Cut the tree at an arbitrary threshold
-    for threshold in [0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56]:
+    for threshold in [0.39, 0.4, 0.41, 0.42, 0.43, 0.44]:
         cand_clustering = hg.labelisation_horizontal_cut_from_threshold(
                 tune_tree, tune_altitudes, threshold)
 
