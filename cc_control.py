@@ -193,10 +193,10 @@ def get_max_agree_sdp_cc(graph, edge_weights):
 
     # run avg-linkage HAC on pairwise probabilities
     logging.info('Running HAC on pairwise probabilities')
-    graph, edge_weights = hg.adjacency_matrix_2_undirected_graph(
+    pp_graph, pp_edge_weights = hg.adjacency_matrix_2_undirected_graph(
             np.triu(X.value, k=1))
     tree, altitudes = hg.binary_partition_tree_average_linkage(
-            graph, 1.0-edge_weights)
+            pp_graph, 1.0-pp_edge_weights)
 
     embed()
     exit()
