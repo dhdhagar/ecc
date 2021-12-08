@@ -167,12 +167,8 @@ def max_agree_objective(graph, edge_weights, cand_clustering):
 def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
     total = 0.0
     for i in nb.prange(num_edges):
-        s = srcs[i]
-        t = tgts[i]
-        w = edge_weights[i]
-        same_cluster = (cand_clustering[s] == cand_clustering[t])
-        if same_cluster:
-            total += w
+        if cand_clustering[srcs[i]] == cand_clustering[tgts[i]]:
+            total += edge_weights[i]
     return total
 
 
