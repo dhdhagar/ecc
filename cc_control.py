@@ -9,13 +9,13 @@ import collections
 import faiss
 import higra as hg
 import logging
+import time
 
 import cvxpy as cp
 import numba as nb
 import numpy as np
 from scipy.sparse import coo_matrix
 from sklearn.metrics import adjusted_rand_score
-import time
 
 from IPython import embed
 
@@ -147,14 +147,14 @@ def build_knn_sw_graph(ds, k, p):
     # [-1, 1] -> [0, 1]
     edge_weights = (edge_weights / 2) + 0.5
 
-    logging.info('Built kNN graph with %d nodes and %d edges',
+    logging.info('Built kNN+SW graph with %d nodes and %d edges',
                  g.num_vertices(), g.num_edges())
 
     return (g, edge_weights) 
 
 
-def rescale_edge_weights(edge_weights, threshold):
-    return np.clip(edge_weights - threshold + 0.5, 0, 1)
+def shift_edge_weights(edge_weights, threshold):
+    return edge_weights - threshold
 
 
 def max_agree_objective(graph, edge_weights, cand_clustering):
@@ -179,16 +179,25 @@ def get_max_agree_sdp_cc(graph, edge_weights):
     srcs, tgts = graph.edge_list()
     W = coo_matrix((edge_weights, (srcs, tgts)), shape=(n, n), dtype=np.double)
     
-    logging.info('Constructing optimization problem')
     # Define and solve the CVXPY specified optimization problem
+    logging.info('Constructing optimization problem')
     X = cp.Variable((n, n), PSD=True)
     constraints = [
             cp.diag(X) == np.ones((n,)),
             X >= 0
     ]
-
     prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
-        
+
+    logging.info('Solving optimization problem')
+    prob.solve(solver=cp.SCS, verbose=True)
+
+    # run avg-linkage HAC on pairwise probabilities
+    logging.info('Running HAC on pairwise probabilities')
+    graph, edge_weights = hg.adjacency_matrix_2_undirected_graph(
+            np.triu(X.value, k=1))
+    tree, altitudes = hg.binary_partition_tree_average_linkage(
+            graph, 1.0-edge_weights)
+
     embed()
     exit()
 
@@ -210,16 +219,19 @@ if __name__ == '__main__':
 
     k = 20
     p = 0.5
-    logging.info('Building kNN graph on tune (k=%d)', k)
+    threshold = 0.5
+
+    logging.info('Building kNN+SW graph on tune (k=%d, p=%f)', k, p)
     tune_graph, tune_edge_weights = build_knn_sw_graph(tune_ds, k, p)
+
+    # shift edge weights using given threshold
+    tune_edge_weights = shift_edge_weights(tune_edge_weights, threshold)
 
     cand_clustering = get_max_agree_sdp_cc(tune_graph, tune_edge_weights)
 
     logging.info('Done.')
     exit()
 
-    # Rescale edge weights using given new threshold
-    #tune_edge_weights = rescale_edge_weights(tune_edge_weights, 0.6)
 
     # Higra expects edge weights to be distances, so we subtract similarities
     # from 1.0 to get distances.
