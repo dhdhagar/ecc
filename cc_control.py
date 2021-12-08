@@ -9,9 +9,11 @@ import collections
 import faiss
 import higra as hg
 import logging
+
+import cvxpy as cp
 import numba as nb
 import numpy as np
-import scipy
+from scipy.sparse import coo_matrix
 from sklearn.metrics import adjusted_rand_score
 import time
 
@@ -80,24 +82,61 @@ def split_tune_test(ds, tune_percentage=0.5):
     return tune_ds, test_ds
 
 
-def build_knn_graph(ds, k):
+@nb.njit(nogil=True, parallel=True)
+def rewire_graph(adj_list, rewire_mask, n, m):
+    for i in nb.prange(n):
+        for j in nb.prange(m):
+            if rewire_mask[i][j]:
+                tgt = adj_list[i][j]
+                edges = adj_list[i]
+                while True:
+                    tgt = np.random.randint(m)
+                    contained = False
+                    for e in edges:
+                        if tgt == e:
+                            contained = True
+                            break
+                    if not contained:
+                        break
+                adj_list[i][j] = tgt
+    return adj_list
+
+
+@nb.njit(nogil=True, parallel=True)
+def compute_similarity_matrix(adj_list, vecs, n, m):
+    sims_mx = np.empty(adj_list.shape, dtype=np.double)
+    for i in nb.prange(n):
+        for j in nb.prange(m):
+            sims_mx[i][j] = np.dot(vecs[i], vecs[j])
+    return sims_mx
+
+
+def build_knn_sw_graph(ds, k, p):
     idxs, vecs, lbls = ds
 
     n, d = vecs.shape
     index = faiss.IndexFlatIP(d) 
     index.add(vecs)
 
-    S, I = index.search(vecs, k+1)
+    _, adj_list = index.search(vecs, k+1)
 
-    remove_mask = (idxs[:,None] == I)
-    remove_mask[:,-1] = ~np.sum(idxs[:, None] == I, axis=1, dtype=bool)
+    # rewire w/ probability `p`
+    rewire_mask = (np.random.rand(*adj_list.shape) < p)
+    adj_list = rewire_graph(adj_list, rewire_mask, n, k+1)
 
-    S = S[~remove_mask].reshape(n, k)
-    I = I[~remove_mask].reshape(n, k)
+    # compute `sims_mx` matrix given rewired `adj_list`
+    sims_mx = compute_similarity_matrix(adj_list, vecs, n, k+1)
 
+    # remove self loops
+    remove_mask = (idxs[:,None] == adj_list)
+    remove_mask[:,-1] = ~np.sum(remove_mask[:,:-1], axis=1, dtype=bool)
+    sims_mx = sims_mx[~remove_mask].reshape(n, k)
+    adj_list = adj_list[~remove_mask].reshape(n, k)
+
+    # build higra graph
     g = hg.UndirectedGraph(n)
     edge_weights = []
-    for s, t_array, wt_array in zip(idxs, I, S):
+    for s, t_array, wt_array in zip(idxs, adj_list, sims_mx):
         idx_gt_mask = t_array > s
         s_adj_tgts = t_array[idx_gt_mask]
         s_adj_srcs = np.full(s_adj_tgts.shape, s)
@@ -129,16 +168,34 @@ def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
     total = 0.0
     for i in nb.prange(num_edges):
         s = srcs[i]
-                
         t = tgts[i]
         w = edge_weights[i]
         same_cluster = (cand_clustering[s] == cand_clustering[t])
         if same_cluster:
             total += w
-        else:
-            total += 1 - w
     return total
+
+
+def get_max_agree_sdp_cc(graph, edge_weights):
+    n = graph.num_vertices()
+
+    logging.info('Constructing weight matrices')
+    srcs, tgts = graph.edge_list()
+    W = coo_matrix((edge_weights, (srcs, tgts)), shape=(n, n), dtype=np.double)
+    
+    logging.info('Constructing optimization problem')
+    # Define and solve the CVXPY specified optimization problem
+    X = cp.Variable((n, n), PSD=True)
+    constraints = [
+            cp.diag(X) == np.ones((n,)),
+            X >= 0
+    ]
+
+    prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
         
+    embed()
+    exit()
+
 
 if __name__ == '__main__':
 
@@ -152,16 +209,21 @@ if __name__ == '__main__':
     ]
 
     ds = load_xcluster_tsv(dataset_fnames[1])
-    tiny_ds = subsample_ds(ds, approx_size=2000)
+    tiny_ds = subsample_ds(ds, approx_size=200)
     tune_ds, test_ds = split_tune_test(tiny_ds)
 
-    k = 100
+    k = 20
+    p = 0.5
     logging.info('Building kNN graph on tune (k=%d)', k)
-    tune_graph, tune_edge_weights = build_knn_graph(tune_ds, k)
+    tune_graph, tune_edge_weights = build_knn_sw_graph(tune_ds, k, p)
 
+    cand_clustering = get_max_agree_sdp_cc(tune_graph, tune_edge_weights)
+
+    logging.info('Done.')
+    exit()
+
+    # Rescale edge weights using given new threshold
     #tune_edge_weights = rescale_edge_weights(tune_edge_weights, 0.6)
-
-    
 
     # Higra expects edge weights to be distances, so we subtract similarities
     # from 1.0 to get distances.
