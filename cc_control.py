@@ -5,6 +5,7 @@
 #       python cc_control.py
 #
 
+import copy
 import collections
 import faiss
 import higra as hg
@@ -172,6 +173,40 @@ def _max_agree_objective(srcs, tgts, edge_weights, cand_clustering, num_edges):
     return total
 
 
+@nb.njit(nogil=True, parallel=True)
+def get_intra_cluster_energy(leaves, srcs, tgts, edge_weights, num_edges):
+    total = 0.0
+    for i in nb.prange(num_edges):
+        if srcs[i] in leaves and tgts[i] in leaves:
+            total += edge_weights[i]
+    return total
+
+
+def get_flat_clustering(tree, graph, edge_weights):
+    n = graph.num_vertices()
+    m = graph.num_edges()
+    srcs, tgts = graph.edge_list()
+    parents = tree.parents()
+    membership = copy.deepcopy(parents[:n])
+    best_clustering = np.arange(n)
+    obj_vals = np.zeros((2*n - 1,))
+
+    for node in tree.leaves_to_root_iterator(
+            include_leaves=False, include_root=True):
+        leaves_mask = (membership == node)
+        leaves = np.where(leaves_mask)[0]
+        obj_vals[node] = get_intra_cluster_energy(
+                leaves, srcs, tgts, edge_weights, m)
+        curr_obj_val = sum([obj_vals[i] 
+            for i in np.unique(best_clustering[leaves_mask])])
+        if obj_vals[node] > curr_obj_val:
+            best_clustering[leaves_mask] = node
+        membership[leaves_mask] = parents[node]
+
+    embed()
+    exit()
+
+
 def get_max_agree_sdp_cc(graph, edge_weights):
     n = graph.num_vertices()
 
@@ -198,8 +233,11 @@ def get_max_agree_sdp_cc(graph, edge_weights):
     tree, altitudes = hg.binary_partition_tree_average_linkage(
             pp_graph, 1.0-pp_edge_weights)
 
-    embed()
-    exit()
+    # find best cut according to IC objective
+    pred_clustering = get_flat_clustering(tree, graph, edge_weights)
+
+    return pred_clustering
+
 
 
 if __name__ == '__main__':
