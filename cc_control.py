@@ -203,8 +203,7 @@ def get_flat_clustering(tree, graph, edge_weights):
             best_clustering[leaves_mask] = node
         membership[leaves_mask] = parents[node]
 
-    embed()
-    exit()
+    return best_clustering
 
 
 def get_max_agree_sdp_cc(graph, edge_weights):
@@ -235,6 +234,9 @@ def get_max_agree_sdp_cc(graph, edge_weights):
 
     # find best cut according to IC objective
     pred_clustering = get_flat_clustering(tree, graph, edge_weights)
+
+    embed()
+    exit()
 
     return pred_clustering
 
