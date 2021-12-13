@@ -60,11 +60,18 @@ class SparseToDenseEncoder(pl.LightningModule):
         pred, target = self._compute_all_pairs(batch)
         val_loss = self.loss_fn(pred, target)
         val_auroc = self.auroc(pred, target.long())
-        print(val_auroc)
-        self.log_dict({'val_loss': val_loss, 'val_auroc': val_auroc})
+        metrics = {'val_loss': val_loss, 'val_auroc': val_auroc}
+        self.log_dict(metrics)
+        return metrics
+
+    def validation_epoch_end(self, outputs):
+        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+        avg_auroc = torch.stack([x['val_auroc'] for x in outputs]).mean()
+        print('val_loss', avg_loss.item())
+        print('val_auroc', avg_auroc.item())
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-1)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
 
@@ -87,8 +94,8 @@ def sparse_matrix_to_sparse_tensor(matrix):
 
 
 if __name__ == '__main__':
-
-    random.seed(42)
+    seed = 42
+    pl.utilities.seed.seed_everything(seed)
 
     train_size = 50
     dev_size = 25
@@ -143,13 +150,13 @@ if __name__ == '__main__':
     dev_ds = TensorDataset(dev_feats_tensor, torch.LongTensor(dev_labels))
 
     train_loader = DataLoader(train_ds, batch_size=100, shuffle=True)
-    dev_loader = DataLoader(dev_ds, batch_size=100, shuffle=True)
+    dev_loader = DataLoader(dev_ds, batch_size=100)
 
     dense_dim = 64
     model = SparseToDenseEncoder(train_sparse_embeds.shape[1], dense_dim)
-    trainer = pl.Trainer()
+    trainer = pl.Trainer(max_epochs=1000, check_val_every_n_epoch=100)
     trainer.fit(model, train_loader, dev_loader)
-    trainer.validate(dev_loader)
+    trainer.validate(model, dev_loader)
     
     embed()
     exit()
