@@ -149,7 +149,6 @@ dependencies:
     - scs==3.0.0
     - setuptools==59.5.0
     - smart-open==5.2.1
-    - spacy==3.2.1
     - spacy-legacy==3.0.8
     - spacy-loggers==1.0.1
     - srsly==2.4.2
