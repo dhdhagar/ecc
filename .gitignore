@@ -131,3 +131,6 @@ dmypy.json
 # rangell
 .*.swo
 .*.swp
+*model_checkpoints*
+*lightning_logs*
+*wandb*

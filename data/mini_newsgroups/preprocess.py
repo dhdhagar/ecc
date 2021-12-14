@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import AUROC
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from IPython import embed
 
@@ -32,6 +33,7 @@ class SparseToDenseEncoder(pl.LightningModule):
 
     def __init__(self, in_dim, out_dim):
         super().__init__()
+        self.save_hyperparameters()
         self.encoder = nn.Linear(in_dim, out_dim)
         self.loss_fn = nn.BCEWithLogitsLoss()
         self.auroc = AUROC(pos_label=1)
@@ -71,7 +73,11 @@ class SparseToDenseEncoder(pl.LightningModule):
         print('val_auroc', avg_auroc.item())
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(
+                self.parameters(),
+                lr=1e-3,
+                weight_decay=1e-4
+        )
         return optimizer
 
 
@@ -146,17 +152,41 @@ if __name__ == '__main__':
     dev_labels = [label_id_map[label] for label in labels_by_split['dev']]
     test_labels = [label_id_map[label] for label in labels_by_split['test']]
 
+    # get dataset stuff organized for training
     train_ds = TensorDataset(train_feats_tensor, torch.LongTensor(train_labels))
     dev_ds = TensorDataset(dev_feats_tensor, torch.LongTensor(dev_labels))
 
     train_loader = DataLoader(train_ds, batch_size=100, shuffle=True)
-    dev_loader = DataLoader(dev_ds, batch_size=100)
+    dev_loader = DataLoader(dev_ds, batch_size=500)
 
+    # train the model
     dense_dim = 64
     model = SparseToDenseEncoder(train_sparse_embeds.shape[1], dense_dim)
-    trainer = pl.Trainer(max_epochs=1000, check_val_every_n_epoch=100)
+    model.train()
+    checkpoint_callback = ModelCheckpoint(
+            monitor='val_auroc',
+            dirpath='model_checkpoints/',
+            filename='sparse_to_dense_encoder-{epoch:04d}-{val_auroc:.4f}',
+            save_top_k=1,
+            mode='max'
+    )
+    trainer = pl.Trainer(
+            max_epochs=100,
+            check_val_every_n_epoch=1,
+            callbacks=[checkpoint_callback]
+    )
     trainer.fit(model, train_loader, dev_loader)
-    trainer.validate(model, dev_loader)
     
+    # load the best model
+    print('Best model path: ', checkpoint_callback.best_model_path)
+    model = SparseToDenseEncoder.load_from_checkpoint(
+            checkpoint_callback.best_model_path
+    )
+    model.eval()
+
+    # build complete graph over dev embeddings
+    dev_dense_embeds = model(dev_feats_tensor)
+
     embed()
     exit()
+
