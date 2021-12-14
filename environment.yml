@@ -132,7 +132,6 @@ dependencies:
     - cvxpy==1.1.17
     - cymem==2.0.6
     - ecos==2.0.7.post1
-    - en-core-web-sm==3.2.0
     - faiss-cpu==1.7.1.post2
     - higra==0.6.4
     - idna==3.3
