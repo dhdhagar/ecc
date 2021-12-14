@@ -5,28 +5,29 @@
 #
 
 import collections
+import copy
 import glob
+import logging
 import os
 import pickle
 import random 
 
+import cvxpy as cp
+import higra as hg
+import numba as nb
 import numpy as np
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from scipy.sparse import coo_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
-from spacy.tokenizer import Tokenizer
-from spacy.lang.en import English
+from sklearn.metrics import adjusted_rand_score
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import AUROC
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
 
 from IPython import embed
-
-
-nlp = English()
-tokenizer = Tokenizer(nlp.vocab)
 
 
 class SparseToDenseEncoder(pl.LightningModule):
@@ -79,6 +80,133 @@ class SparseToDenseEncoder(pl.LightningModule):
                 weight_decay=1e-4
         )
         return optimizer
+
+
+@nb.njit(nogil=True, parallel=True)
+def get_intra_cluster_energy(leaves, srcs, tgts, edge_weights, num_edges):
+    total = 0.0
+    for i in nb.prange(num_edges):
+        if srcs[i] in leaves and tgts[i] in leaves:
+            total += edge_weights[i]
+    return total
+
+
+def get_flat_clustering(tree, graph, edge_weights):
+    n = graph.num_vertices()
+    m = graph.num_edges()
+    srcs, tgts = graph.edge_list()
+    parents = tree.parents()
+    membership = copy.deepcopy(parents[:n])
+    best_clustering = np.arange(n)
+    obj_vals = np.zeros((2*n - 1,))
+
+    for node in tree.leaves_to_root_iterator(
+            include_leaves=False, include_root=True):
+        leaves_mask = (membership == node)
+        leaves = np.where(leaves_mask)[0]
+        obj_vals[node] = get_intra_cluster_energy(
+                leaves, srcs, tgts, edge_weights, m)
+        curr_obj_val = sum([obj_vals[i] 
+            for i in np.unique(best_clustering[leaves_mask])])
+        if obj_vals[node] > curr_obj_val:
+            best_clustering[leaves_mask] = node
+        membership[leaves_mask] = parents[node]
+
+    return best_clustering
+
+
+def get_max_agree_sdp_cc(graph, edge_weights):
+    n = graph.num_vertices()
+
+    logging.info('Constructing weight matrices')
+    srcs, tgts = graph.edge_list()
+    W = coo_matrix((edge_weights, (srcs, tgts)), shape=(n, n), dtype=np.double)
+    
+    # Define and solve the CVXPY specified optimization problem
+    logging.info('Constructing optimization problem')
+    X = cp.Variable((n, n), PSD=True)
+    constraints = [
+            cp.diag(X) == np.ones((n,)),
+            X >= 0
+    ]
+    prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
+
+    logging.info('Solving optimization problem')
+    prob.solve(solver=cp.SCS, verbose=True)
+
+    # run avg-linkage HAC on pairwise probabilities
+    logging.info('Running HAC on pairwise probabilities')
+    pp_graph, pp_edge_weights = hg.adjacency_matrix_2_undirected_graph(
+            np.triu(X.value, k=1))
+    tree, altitudes = hg.binary_partition_tree_average_linkage(
+            pp_graph, 1.0-pp_edge_weights)
+
+    # find best cut according to IC objective
+    pred_clustering = get_flat_clustering(tree, graph, edge_weights)
+    return pred_clustering
+
+
+def shift_edge_weights(edge_weights, threshold):
+    return edge_weights - threshold
+
+
+def build_higra_complete_graph(embeds):
+    # compute complete graph adjacency matrix
+    adj_mx = coo_matrix(np.triu(embeds @ embeds.T, k=1))
+
+    # build the graph
+    graph = hg.UndirectedGraph(embeds.shape[0])
+    graph.add_edges(adj_mx.row, adj_mx.col)
+    edge_weights = adj_mx.data
+
+    return (graph, edge_weights)
+
+
+def get_best_threshold(embeds, labels):
+    assert embeds.shape[0] == len(labels)
+    graph, edge_weights = build_higra_complete_graph(embeds)
+    thresholds = sorted(list(edge_weights))
+
+    best_rand_idx = -1
+    best_threshold = thresholds[0]
+
+    while len(thresholds) > 1:
+        quartile_idxs = [
+                int(len(thresholds)/4),
+                int(len(thresholds)/2), 
+                int(3*len(thresholds)/4)
+        ]
+        quartile_thresholds = [thresholds[i] for i in quartile_idxs]
+        quartile_rand_idxs = []
+        for t in quartile_thresholds:
+            tmp_edge_weights = shift_edge_weights(edge_weights, t)
+            cand_clustering = get_max_agree_sdp_cc(graph, tmp_edge_weights)
+            quartile_rand_idxs.append(
+                    adjusted_rand_score(labels, cand_clustering)
+            )
+        best_quartile_idx = max(range(3), key=lambda i: quartile_rand_idxs[i])
+        if quartile_rand_idxs[best_quartile_idx] > best_rand_idx:
+            best_rand_idx = quartile_rand_idxs[best_quartile_idx]
+            best_threshold = quartile_thresholds[best_quartile_idx]
+
+        # shrink the thresholds list
+        if best_quartile_idx == 0:
+            thresholds = thresholds[:quartile_idxs[1]]
+        elif best_quartile_idx == 1:
+            thresholds = thresholds[quartile_idxs[0]+1:quartile_idxs[2]]
+        elif best_quartile_idx == 2:
+            thresholds = thresholds[quartile_idxs[1]+1:]
+        else:
+            raise ValueError('Something went wrong with quartile_idxs')
+
+        print('Best Rand Idx: ', best_rand_idx)
+        print('Best Threshold: ', best_threshold)
+        print('Len Thresholds: ', len(thresholds))
+        
+        embed()
+        exit()
+
+    return best_threshold
 
 
 def get_doc_text(doc_path):
@@ -159,33 +287,39 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_ds, batch_size=100, shuffle=True)
     dev_loader = DataLoader(dev_ds, batch_size=500)
 
-    # train the model
-    dense_dim = 64
-    model = SparseToDenseEncoder(train_sparse_embeds.shape[1], dense_dim)
-    model.train()
-    checkpoint_callback = ModelCheckpoint(
-            monitor='val_auroc',
-            dirpath='model_checkpoints/',
-            filename='sparse_to_dense_encoder-{epoch:04d}-{val_auroc:.4f}',
-            save_top_k=1,
-            mode='max'
-    )
-    trainer = pl.Trainer(
-            max_epochs=100,
-            check_val_every_n_epoch=1,
-            callbacks=[checkpoint_callback]
-    )
-    trainer.fit(model, train_loader, dev_loader)
+    ## train the model
+    #dense_dim = 64
+    #model = SparseToDenseEncoder(train_sparse_embeds.shape[1], dense_dim)
+    #model.train()
+    #checkpoint_callback = ModelCheckpoint(
+    #        monitor='val_auroc',
+    #        dirpath='model_checkpoints/',
+    #        filename='sparse_to_dense_encoder-{epoch:04d}-{val_auroc:.4f}',
+    #        save_top_k=1,
+    #        mode='max'
+    #)
+    #trainer = pl.Trainer(
+    #        max_epochs=100,
+    #        check_val_every_n_epoch=1,
+    #        callbacks=[checkpoint_callback]
+    #)
+    #trainer.fit(model, train_loader, dev_loader)
+    #best_model_path = checkpoint_callback.best_model_path
     
     # load the best model
-    print('Best model path: ', checkpoint_callback.best_model_path)
-    model = SparseToDenseEncoder.load_from_checkpoint(
-            checkpoint_callback.best_model_path
-    )
+    best_model_path = '/mnt/nfs/work1/brun/rangell/ecc/data/mini_newsgroups/model_checkpoints/sparse_to_dense_encoder-epoch=0030-val_auroc=0.9099.ckpt'
+    print('Best model path: ', best_model_path)
+    model = SparseToDenseEncoder.load_from_checkpoint(best_model_path)
     model.eval()
 
-    # build complete graph over dev embeddings
-    dev_dense_embeds = model(dev_feats_tensor)
+    # get all dense dev embeddings
+    with torch.no_grad():
+        dev_dense_embeds = model(dev_feats_tensor).detach().numpy()
+
+    # find the best threshold on dev
+    threshold = get_best_threshold(dev_dense_embeds, dev_labels)
+
+    print('Best threshold: ', threshold)
 
     embed()
     exit()

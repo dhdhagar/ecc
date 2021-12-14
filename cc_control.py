@@ -8,11 +8,11 @@
 import copy
 import collections
 import faiss
-import higra as hg
 import logging
 import time
 
 import cvxpy as cp
+import higra as hg
 import numba as nb
 import numpy as np
 from scipy.sparse import coo_matrix
