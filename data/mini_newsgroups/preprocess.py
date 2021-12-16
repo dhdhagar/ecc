@@ -132,7 +132,7 @@ def get_max_agree_sdp_cc(graph, edge_weights):
     prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
     logging.info('Solving optimization problem')
-    prob.solve(solver=cp.SCS, verbose=True)
+    prob.solve(solver=cp.SCS, verbose=True, use_indirect=False, max_iters=2500)
 
     # run avg-linkage HAC on pairwise probabilities
     logging.info('Running HAC on pairwise probabilities')
@@ -202,9 +202,6 @@ def get_best_threshold(embeds, labels):
         print('Best Rand Idx: ', best_rand_idx)
         print('Best Threshold: ', best_threshold)
         print('Len Thresholds: ', len(thresholds))
-        
-        embed()
-        exit()
 
     return best_threshold
 
@@ -320,7 +317,3 @@ if __name__ == '__main__':
     threshold = get_best_threshold(dev_dense_embeds, dev_labels)
 
     print('Best threshold: ', threshold)
-
-    embed()
-    exit()
-
