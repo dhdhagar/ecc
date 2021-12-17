@@ -4,7 +4,7 @@ import random
 
 import numpy as np
 import pytorch_lightning as pl
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
 from IPython import embed
 
@@ -76,7 +76,8 @@ def gen_synth_data(num_clusters: int,
 
     dc_graph = {
             'edge_weights': edge_weights,
-            'features': point_features,
+            'cluster_features': csr_matrix(cluster_features),
+            'point_features': csr_matrix(point_features),
             'labels': point_labels
     }
 
@@ -93,7 +94,7 @@ if __name__ == '__main__':
     cluster_feature_noise=0.3
     point_feature_sample_prob=0.5
     edge_weight_mean=1.0
-    edge_weight_stddev=1.0
+    edge_weight_stddev=2.0
     out_fname = 'tiny_data.pkl'
 
     tiny_data = gen_synth_data(num_clusters=num_clusters,
