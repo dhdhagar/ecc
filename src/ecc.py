@@ -12,6 +12,7 @@ import time
 import cvxpy as cp
 import higra as hg
 import numba as nb
+from numba.typed import List
 import numpy as np
 import pytorch_lightning as pl
 from scipy.sparse import csr_matrix
@@ -33,20 +34,107 @@ class EccClusterer(object):
         self.ecc_constraints.append(ecc_constraint)
         self.n += 1
 
+    @staticmethod
+    @nb.njit(nogil=True, parallel=True)
+    def _set_incompat_mx(n: int,
+                         m: int,
+                         indptr_a: np.ndarray,
+                         indices_a: np.ndarray,
+                         data_a: np.ndarray,
+                         indptr_b: np.ndarray,
+                         indices_b: np.ndarray,
+                         data_b: np.ndarray,
+                         incompat_mx: np.ndarray):
+        for i in nb.prange(n):
+            for j in nb.prange(m):
+                ptr_a = indptr_a[i]
+                ptr_b = indptr_b[j]
+                next_ptr_a = indptr_a[i+1]
+                next_ptr_b = indptr_b[j+1]
+                while ptr_a < next_ptr_a and ptr_b < next_ptr_b:
+                    if indices_a[ptr_a] < indices_b[ptr_b]:
+                        ptr_a += 1
+                    elif indices_a[ptr_a] > indices_b[ptr_b]:
+                        ptr_b += 1
+                    else:
+                        if data_a[ptr_a] * data_b[ptr_b] == -1:
+                            incompat_mx[i, j] = True
+                            break
+                        ptr_a += 1
+                        ptr_b += 1
+
+    @staticmethod
+    @nb.njit(nogil=True)
+    def _get_feat_satisfied_hyperplanes(feats_indptr: np.ndarray,
+                                        feats_indices: np.ndarray,
+                                        pos_ecc_indptr: np.ndarray,
+                                        pos_ecc_indices: np.ndarray,
+                                        incompat_mx: np.ndarray):
+        ecc_indices = List.empty_list(nb.int64)
+        points_indptr = List.empty_list(nb.int64)
+        points_indices = List.empty_list(nb.int64)
+
+        points_indptr.append(0)
+        for ecc_idx in range(pos_ecc_indptr.size-1):
+            pos_feat_ptr = pos_ecc_indptr[ecc_idx]
+            next_pos_feat_ptr = pos_ecc_indptr[ecc_idx+1]
+            while pos_feat_ptr < next_pos_feat_ptr:
+                ecc_indices.append(ecc_idx)
+                points_indptr.append(points_indptr[-1])
+                feat_id = pos_ecc_indices[pos_feat_ptr]
+                point_ptr = feats_indptr[feat_id]
+                next_point_ptr = feats_indptr[feat_id+1]
+
+                while point_ptr < next_point_ptr:
+                    point_idx = feats_indices[point_ptr]
+                    if not incompat_mx[point_idx, ecc_idx]:
+                        points_indptr[-1] += 1
+                        points_indices.append(point_idx)
+                    point_ptr += 1
+                pos_feat_ptr += 1
+
+        return (ecc_indices, points_indptr, points_indices)
+
     def solve_sdp(self):
         num_points = self.features.shape[0]
         num_ecc = len(self.ecc_constraints)
 
+        # "negative" sdp constraints
+        ecc_mx = sp_vstack(self.ecc_constraints)
+        uni_feats = sp_vstack([self.features, ecc_mx])
+        incompat_mx = np.zeros((num_points+num_ecc, num_ecc), dtype=bool)
+        self._set_incompat_mx(num_points+num_ecc,
+                              num_ecc,
+                              uni_feats.indptr,
+                              uni_feats.indices,
+                              uni_feats.data,
+                              ecc_mx.indptr,
+                              ecc_mx.indices,
+                              ecc_mx.data,
+                              incompat_mx)
+        ortho_indices = [(a, b+num_points)
+                for a, b in zip(*np.where(incompat_mx))]
+
+        # "positive" sdp constraints
+        bin_features = self.features.astype(bool).tocsc()
+        pos_ecc_mx = (ecc_mx > 0)
+        (ecc_indices,
+         points_indptr,
+         points_indices) = self._get_feat_satisfied_hyperplanes(
+                 bin_features.indptr,
+                 bin_features.indices,
+                 pos_ecc_mx.indptr,
+                 pos_ecc_mx.indices,
+                 incompat_mx)
+        ecc_indices = [x + num_points for x in ecc_indices]
+        points_indptr = list(points_indptr)
+        points_indices = list(points_indices)
+
+        # formulate SDP
         logging.info('Constructing optimization problem')
         W = csr_matrix((self.edge_weights.data,
                         (self.edge_weights.row, self.edge_weights.col)),
                         shape=(self.n, self.n))
-        ecc_mx = sp_vstack(self.ecc_constraints).T.tocsc()
-        uni_feats = sp_vstack([self.features, ecc_mx])
-
-        embed()
-        exit()
-
         X = cp.Variable((self.n, self.n), PSD=True)
         constraints = [
                 cp.diag(X) == np.ones((self.n,)),
