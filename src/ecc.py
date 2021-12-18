@@ -15,7 +15,7 @@ import numba as nb
 from numba.typed import List
 import numpy as np
 import pytorch_lightning as pl
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, csc_matrix
 from scipy.sparse import vstack as sp_vstack
 from sklearn.metrics import adjusted_rand_score
 
@@ -32,6 +32,7 @@ class EccClusterer(object):
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
+        self.ecc_mx = sp_vstack(self.ecc_constraints)
         self.n += 1
 
     @staticmethod
@@ -100,24 +101,23 @@ class EccClusterer(object):
         num_ecc = len(self.ecc_constraints)
 
         # "negative" sdp constraints
-        ecc_mx = sp_vstack(self.ecc_constraints)
-        uni_feats = sp_vstack([self.features, ecc_mx])
+        uni_feats = sp_vstack([self.features, self.ecc_mx])
         incompat_mx = np.zeros((num_points+num_ecc, num_ecc), dtype=bool)
         self._set_incompat_mx(num_points+num_ecc,
                               num_ecc,
                               uni_feats.indptr,
                               uni_feats.indices,
                               uni_feats.data,
-                              ecc_mx.indptr,
-                              ecc_mx.indices,
-                              ecc_mx.data,
+                              self.ecc_mx.indptr,
+                              self.ecc_mx.indices,
+                              self.ecc_mx.data,
                               incompat_mx)
         ortho_indices = [(a, b+num_points)
                 for a, b in zip(*np.where(incompat_mx))]
 
         # "positive" sdp constraints
         bin_features = self.features.astype(bool).tocsc()
-        pos_ecc_mx = (ecc_mx > 0)
+        pos_ecc_mx = (self.ecc_mx > 0)
         (ecc_indices,
          points_indptr,
          points_indices) = self._get_feat_satisfied_hyperplanes(
@@ -151,7 +151,7 @@ class EccClusterer(object):
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        prob.solve(solver=cp.SCS, verbose=True, max_iters=2500)
+        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000000)
 
         return np.triu(X.value, k=1)
 
@@ -168,12 +168,15 @@ class EccClusterer(object):
         return np.sum(self.edge_weights.data[data_mask])
 
     def get_num_ecc_sat(self, leaves: np.ndarray, num_points: int):
-        embed()
-        exit()
+        point_leaves = leaves[leaves < num_points]
+        ecc_indices = leaves[leaves >= num_points] - num_points
+        feats = get_cluster_feats(self.features[point_leaves])
+        ecc_avail = self.ecc_mx[ecc_indices]
+        to_satisfy = (ecc_avail > 0).sum(axis=1)
+        return ((feats @ ecc_avail.T) == to_satisfy).sum()
 
     def cut_trellis(self, t: hg.Tree):
-        num_ecc = len(self.ecc_constraints)
-        num_points = self.n - num_ecc
+        num_points = self.n - len(self.ecc_constraints)
         parents = t.parents()
         membership = copy.deepcopy(parents[:self.n])
         best_clustering = np.arange(self.n)
@@ -184,7 +187,7 @@ class EccClusterer(object):
                 include_leaves=False, include_root=True):
             leaves_mask = (membership == node)
             leaves = np.where(leaves_mask)[0]
-            num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_ecc)
+            num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_points)
             obj_vals[node] = self.get_intra_cluster_energy(leaves)
             curr_num_ecc_sat = sum([num_ecc_sat[i] 
                 for i in np.unique(best_clustering[leaves_mask])])
@@ -199,6 +202,9 @@ class EccClusterer(object):
         obj_value = sum([obj_vals[i] for i in np.unique(best_clustering)])
         num_ecc_satisfied = sum([num_ecc_sat[i]
             for i in np.unique(best_clustering)])
+
+        embed()
+        exit()
 
         return best_clustering, obj_value, num_ecc_satisfied
 
@@ -221,6 +227,11 @@ class EccClusterer(object):
         }
 
         return pred_clustering, metrics
+
+
+def get_cluster_feats(point_feats: csr_matrix):
+    csc_indptr = point_feats.tocsc().indptr
+    return csr_matrix((np.diff(csc_indptr) > 0).astype(np.int64))
 
 
 def simulate(dc_graph: dict):
