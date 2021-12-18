@@ -136,19 +136,23 @@ class EccClusterer(object):
                         (self.edge_weights.row, self.edge_weights.col)),
                         shape=(self.n, self.n))
         X = cp.Variable((self.n, self.n), PSD=True)
+        # standard correlation clustering constraintsj
         constraints = [
                 cp.diag(X) == np.ones((self.n,)),
                 X >= 0
         ]
-
-        # TODO: build out incompatibility and satisfiability sdp constraints
-        embed()
-        exit()
+        # "negative" ecc constraints
+        constraints.extend([X[i,j] <= 0 for i, j in ortho_indices])
+        # "positive" ecc constraints
+        for idx, i in enumerate(ecc_indices):
+            j_s = points_indices[points_indptr[idx]: points_indptr[idx+1]]
+            constraints.append(sum([X[i,j] for j in j_s]) >= 1)
 
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        prob.solve(solver=cp.SCS, verbose=True)
+        prob.solve(solver=cp.SCS, verbose=True, max_iters=2500)
+
         return np.triu(X.value, k=1)
 
     def build_trellis(self, X: np.ndarray):
@@ -163,7 +167,13 @@ class EccClusterer(object):
         data_mask = row_mask & col_mask
         return np.sum(self.edge_weights.data[data_mask])
 
+    def get_num_ecc_sat(self, leaves: np.ndarray, num_points: int):
+        embed()
+        exit()
+
     def cut_trellis(self, t: hg.Tree):
+        num_ecc = len(self.ecc_constraints)
+        num_points = self.n - num_ecc
         parents = t.parents()
         membership = copy.deepcopy(parents[:self.n])
         best_clustering = np.arange(self.n)
@@ -174,10 +184,15 @@ class EccClusterer(object):
                 include_leaves=False, include_root=True):
             leaves_mask = (membership == node)
             leaves = np.where(leaves_mask)[0]
+            num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_ecc)
             obj_vals[node] = self.get_intra_cluster_energy(leaves)
+            curr_num_ecc_sat = sum([num_ecc_sat[i] 
+                for i in np.unique(best_clustering[leaves_mask])])
             curr_obj_val = sum([obj_vals[i] 
                 for i in np.unique(best_clustering[leaves_mask])])
-            if obj_vals[node] > curr_obj_val:
+            if (num_ecc_sat[node] > curr_num_ecc_sat 
+                or (num_ecc_sat[node] == curr_num_ecc_sat
+                    and obj_vals[node] > curr_obj_val)):
                 best_clustering[leaves_mask] = node
             membership[leaves_mask] = parents[node]
 
