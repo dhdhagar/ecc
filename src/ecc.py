@@ -15,7 +15,7 @@ import numba as nb
 from numba.typed import List
 import numpy as np
 import pytorch_lightning as pl
-from scipy.sparse import csr_matrix, csc_matrix
+from scipy.sparse import csr_matrix, coo_matrix
 from scipy.sparse import vstack as sp_vstack
 from sklearn.metrics import adjusted_rand_score as rand_idx
 
@@ -304,11 +304,34 @@ def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
     all_pos_feats = ((tgt_feats - src_feats) == 1).astype(np.int64)
     all_neg_feats = ((src_feats - tgt_feats) == 1).astype(np.int64)
 
+    # TODO: implement different feature selection strategies based on feat_freq
     assert feat_select_strategy == 'uniform'
 
-    embed()
-    exit()
+    def sample_csr_cols(mx, num_sample, p=None):
+        choices = mx.tocoo().col
+        k = min(num_sample, choices.size)
+        return np.random.choice(choices, (k,), replace=False, p=p)
 
+    sampled_overlap_feats = sample_csr_cols(
+            all_overlap_feats, max_overlap_feats)
+    sampled_pos_feats = sample_csr_cols(all_pos_feats, max_pos_feats)
+    sampled_neg_feats = sample_csr_cols(all_neg_feats, max_neg_feats)
+
+    new_ecc_col = np.hstack(
+            (sampled_overlap_feats,
+             sampled_pos_feats,
+             sampled_neg_feats)
+    )
+    new_ecc_row = np.zeros_like(new_ecc_col)
+    new_ecc_data = np.hstack(
+            (np.ones_like(sampled_overlap_feats),
+             np.ones_like(sampled_pos_feats),
+             -1*np.ones_like(sampled_neg_feats))
+    )
+
+    new_ecc = coo_matrix((new_ecc_data, (new_ecc_row, new_ecc_col)),
+                         shape=src_feats.shape, dtype=np.int64).tocsr()
+    return new_ecc
 
 
 def simulate(dc_graph: dict):
