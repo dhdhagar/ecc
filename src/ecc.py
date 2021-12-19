@@ -17,7 +17,7 @@ import numpy as np
 import pytorch_lightning as pl
 from scipy.sparse import csr_matrix, csc_matrix
 from scipy.sparse import vstack as sp_vstack
-from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import adjusted_rand_score as rand_idx
 
 from IPython import embed
 
@@ -29,6 +29,7 @@ class EccClusterer(object):
         self.features = features
         self.n = self.features.shape[0]
         self.ecc_constraints = []
+        self.ecc_mx = None
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -210,6 +211,8 @@ class EccClusterer(object):
         return best_clustering, obj_value, num_ecc_satisfied
 
     def pred(self):
+        num_ecc = len(self.ecc_constraints)
+
         # Construct and solve SDP
         start_solve_time = time.time()
         X_hat = self.solve_sdp()
@@ -225,6 +228,10 @@ class EccClusterer(object):
                 'sdp_solve_time': end_solve_time - start_solve_time,
                 'obj_value': obj_value,
                 'num_ecc_satisfied': num_ecc_satisfied,
+                'num_ecc': num_ecc,
+                'num_ecc_feats': self.ecc_mx.nnz if self.ecc_mx else 0,
+                'num_pos_ecc_feats': (self.ecc_mx>0).nnz if self.ecc_mx else 0,
+                'num_neg_ecc_feats': (self.ecc_mx<0).nnz if self.ecc_mx else 0,
         }
 
         return pred_clustering, metrics
@@ -235,11 +242,82 @@ def get_cluster_feats(point_feats: csr_matrix):
     return csr_matrix((np.diff(csc_indptr) > 0).astype(np.int64))
 
 
+@nb.njit(nogil=True, parallel=True)
+def set_matching_matrix(gold_indptr: np.ndarray,
+                        gold_indices: np.ndarray,
+                        pred_indptr: np.ndarray,
+                        pred_indices: np.ndarray,
+                        matching_mx: np.ndarray) -> None:
+    for i in nb.prange(gold_indptr.size - 1):
+        for j in nb.prange(pred_indptr.size - 1):
+            gold_ptr = gold_indptr[i]
+            next_gold_ptr = gold_indptr[i+1]
+            pred_ptr = pred_indptr[j]
+            next_pred_ptr = pred_indptr[j+1]
+            num_intersect = 0
+            num_union = 0
+            while gold_ptr < next_gold_ptr and pred_ptr < next_pred_ptr:
+                if gold_indices[gold_ptr] < pred_indices[pred_ptr]:
+                    gold_ptr += 1
+                    num_union += 1
+                elif gold_indices[gold_ptr] > pred_indices[pred_ptr]:
+                    pred_ptr += 1
+                    num_union += 1
+                else:
+                    gold_ptr += 1
+                    pred_ptr += 1
+                    num_intersect += 1
+                    num_union += 1
+            if gold_ptr < next_gold_ptr:
+                num_union += (next_gold_ptr - gold_ptr)
+            elif pred_ptr < next_pred_ptr:
+                num_union += (next_pred_ptr - pred_ptr)
+            matching_mx[i, j] = num_intersect / num_union
+    return matching_mx
+
+
+def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
+                       pred_cluster_feats: csr_matrix,
+                       max_overlap_feats: int,
+                       max_pos_feats: int,
+                       max_neg_feats: int,
+                       feat_freq: np.ndarray,
+                       feat_select_strategy: str = 'uniform'):
+    # pick a pred cluster and target gold cluster
+    matching_mx = np.empty((gold_cluster_feats.shape[0],
+                            pred_cluster_feats.shape[0]))
+    set_matching_matrix(
+            gold_cluster_feats.indptr, gold_cluster_feats.indices,
+            pred_cluster_feats.indptr, pred_cluster_feats.indices,
+            matching_mx
+    )
+    # TODO: maybe replace this next line with softmax instead of uniform?
+    matching_mx = matching_mx / np.sum(matching_mx)
+    pair_ravel_idx = np.where(np.random.multinomial(1, matching_mx.ravel()))
+    gold_cluster_idx, pred_cluster_idx = np.unravel_index(
+            pair_ravel_idx[0][0], matching_mx.shape)
+
+    # select features to for the ecc constraint
+    src_feats = pred_cluster_feats[pred_cluster_idx]
+    tgt_feats = gold_cluster_feats[gold_cluster_idx]
+    all_overlap_feats = ((src_feats + tgt_feats) == 2).astype(np.int64)
+    all_pos_feats = ((tgt_feats - src_feats) == 1).astype(np.int64)
+    all_neg_feats = ((src_feats - tgt_feats) == 1).astype(np.int64)
+
+    assert feat_select_strategy == 'uniform'
+
+    embed()
+    exit()
+
+
+
 def simulate(dc_graph: dict):
     edge_weights = dc_graph['edge_weights']
     point_features = dc_graph['point_features']
     cluster_features = dc_graph['cluster_features']
     gold_clustering = dc_graph['labels']
+
+    feat_freq = np.array(point_features.sum(axis=0))
 
     ecc1 = csr_matrix(2*(cluster_features.todense()[0:1]) - 1)
     ecc2 = csr_matrix(2*(cluster_features.todense()[1:2]) - 1)
@@ -248,12 +326,27 @@ def simulate(dc_graph: dict):
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
+    max_overlap_feats = 2
+    max_pos_feats = 2
+    max_neg_feats = 2
+
     for r in range(10):
-        pred_clustering1, metrics1 = clusterer.pred()
-        clusterer.add_constraint(ecc1)
-        clusterer.add_constraint(ecc2)
-        clusterer.add_constraint(ecc3)
-        pred_clustering2, metrics2 = clusterer.pred()
+        pred_clustering, metrics = clusterer.pred()
+        metrics['rand_idx'] = rand_idx(gold_clustering, pred_clustering)
+
+        pred_cluster_feats = sp_vstack([
+            get_cluster_feats(point_features[pred_clustering == i])
+                for i in np.unique(pred_clustering)
+        ])
+
+        ecc_constraint = gen_ecc_constraint(
+                cluster_features,
+                pred_cluster_feats,
+                max_overlap_feats,
+                max_pos_feats,
+                max_neg_feats,
+                feat_freq
+        )
 
         embed()
         exit()
