@@ -100,35 +100,36 @@ class EccClusterer(object):
         num_points = self.features.shape[0]
         num_ecc = len(self.ecc_constraints)
 
-        # "negative" sdp constraints
-        uni_feats = sp_vstack([self.features, self.ecc_mx])
-        incompat_mx = np.zeros((num_points+num_ecc, num_ecc), dtype=bool)
-        self._set_incompat_mx(num_points+num_ecc,
-                              num_ecc,
-                              uni_feats.indptr,
-                              uni_feats.indices,
-                              uni_feats.data,
-                              self.ecc_mx.indptr,
-                              self.ecc_mx.indices,
-                              self.ecc_mx.data,
-                              incompat_mx)
-        ortho_indices = [(a, b+num_points)
-                for a, b in zip(*np.where(incompat_mx))]
+        if num_ecc > 0:
+            # "negative" sdp constraints
+            uni_feats = sp_vstack([self.features, self.ecc_mx])
+            incompat_mx = np.zeros((num_points+num_ecc, num_ecc), dtype=bool)
+            self._set_incompat_mx(num_points+num_ecc,
+                                  num_ecc,
+                                  uni_feats.indptr,
+                                  uni_feats.indices,
+                                  uni_feats.data,
+                                  self.ecc_mx.indptr,
+                                  self.ecc_mx.indices,
+                                  self.ecc_mx.data,
+                                  incompat_mx)
+            ortho_indices = [(a, b+num_points)
+                    for a, b in zip(*np.where(incompat_mx))]
 
-        # "positive" sdp constraints
-        bin_features = self.features.astype(bool).tocsc()
-        pos_ecc_mx = (self.ecc_mx > 0)
-        (ecc_indices,
-         points_indptr,
-         points_indices) = self._get_feat_satisfied_hyperplanes(
-                 bin_features.indptr,
-                 bin_features.indices,
-                 pos_ecc_mx.indptr,
-                 pos_ecc_mx.indices,
-                 incompat_mx)
-        ecc_indices = [x + num_points for x in ecc_indices]
-        points_indptr = list(points_indptr)
-        points_indices = list(points_indices)
+            # "positive" sdp constraints
+            bin_features = self.features.astype(bool).tocsc()
+            pos_ecc_mx = (self.ecc_mx > 0)
+            (ecc_indices,
+             points_indptr,
+             points_indices) = self._get_feat_satisfied_hyperplanes(
+                     bin_features.indptr,
+                     bin_features.indices,
+                     pos_ecc_mx.indptr,
+                     pos_ecc_mx.indices,
+                     incompat_mx)
+            ecc_indices = [x + num_points for x in ecc_indices]
+            points_indptr = list(points_indptr)
+            points_indices = list(points_indices)
 
         # formulate SDP
         logging.info('Constructing optimization problem')
@@ -141,17 +142,18 @@ class EccClusterer(object):
                 cp.diag(X) == np.ones((self.n,)),
                 X >= 0
         ]
-        # "negative" ecc constraints
-        constraints.extend([X[i,j] <= 0 for i, j in ortho_indices])
-        # "positive" ecc constraints
-        for idx, i in enumerate(ecc_indices):
-            j_s = points_indices[points_indptr[idx]: points_indptr[idx+1]]
-            constraints.append(sum([X[i,j] for j in j_s]) >= 1)
+        if num_ecc > 0:
+            # "negative" ecc constraints
+            constraints.extend([X[i,j] <= 0 for i, j in ortho_indices])
+            # "positive" ecc constraints
+            for idx, i in enumerate(ecc_indices):
+                j_s = points_indices[points_indptr[idx]: points_indptr[idx+1]]
+                constraints.append(sum([X[i,j] for j in j_s]) >= 1)
 
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000000)
+        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000000, warm_start=True)
 
         return np.triu(X.value, k=1)
 
@@ -176,7 +178,8 @@ class EccClusterer(object):
         return ((feats @ ecc_avail.T) == to_satisfy).sum()
 
     def cut_trellis(self, t: hg.Tree):
-        num_points = self.n - len(self.ecc_constraints)
+        num_ecc = len(self.ecc_constraints)
+        num_points = self.n - num_ecc
         parents = t.parents()
         membership = copy.deepcopy(parents[:self.n])
         best_clustering = np.arange(self.n)
@@ -187,7 +190,8 @@ class EccClusterer(object):
                 include_leaves=False, include_root=True):
             leaves_mask = (membership == node)
             leaves = np.where(leaves_mask)[0]
-            num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_points)
+            if num_ecc > 0:
+                num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_points)
             obj_vals[node] = self.get_intra_cluster_energy(leaves)
             curr_num_ecc_sat = sum([num_ecc_sat[i] 
                 for i in np.unique(best_clustering[leaves_mask])])
@@ -200,11 +204,8 @@ class EccClusterer(object):
             membership[leaves_mask] = parents[node]
 
         obj_value = sum([obj_vals[i] for i in np.unique(best_clustering)])
-        num_ecc_satisfied = sum([num_ecc_sat[i]
-            for i in np.unique(best_clustering)])
-
-        embed()
-        exit()
+        num_ecc_satisfied = int(sum([num_ecc_sat[i]
+                for i in np.unique(best_clustering)]))
 
         return best_clustering, obj_value, num_ecc_satisfied
 
@@ -242,14 +243,17 @@ def simulate(dc_graph: dict):
 
     ecc1 = csr_matrix(2*(cluster_features.todense()[0:1]) - 1)
     ecc2 = csr_matrix(2*(cluster_features.todense()[1:2]) - 1)
+    ecc3 = csr_matrix(2*(cluster_features.todense()[2:3]) - 1)
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
     for r in range(10):
+        pred_clustering1, metrics1 = clusterer.pred()
         clusterer.add_constraint(ecc1)
         clusterer.add_constraint(ecc2)
-        pred_clustering, metrics = clusterer.pred()
+        clusterer.add_constraint(ecc3)
+        pred_clustering2, metrics2 = clusterer.pred()
 
         embed()
         exit()
