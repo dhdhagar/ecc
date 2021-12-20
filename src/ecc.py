@@ -154,7 +154,7 @@ class EccClusterer(object):
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000000, warm_start=True)
+        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000000)
 
         return np.triu(X.value, k=1)
 
@@ -208,7 +208,7 @@ class EccClusterer(object):
         num_ecc_satisfied = int(sum([num_ecc_sat[i]
                 for i in np.unique(best_clustering)]))
 
-        return best_clustering, obj_value, num_ecc_satisfied
+        return best_clustering[:num_points], obj_value, num_ecc_satisfied
 
     def pred(self):
         num_ecc = len(self.ecc_constraints)
@@ -229,9 +229,14 @@ class EccClusterer(object):
                 'obj_value': obj_value,
                 'num_ecc_satisfied': num_ecc_satisfied,
                 'num_ecc': num_ecc,
-                'num_ecc_feats': self.ecc_mx.nnz if self.ecc_mx else 0,
-                'num_pos_ecc_feats': (self.ecc_mx>0).nnz if self.ecc_mx else 0,
-                'num_neg_ecc_feats': (self.ecc_mx<0).nnz if self.ecc_mx else 0,
+                'frac_ecc_satisfied': num_ecc_satisfied / num_ecc
+                        if num_ecc > 0 else 0.0,
+                'num_ecc_feats': self.ecc_mx.nnz 
+                        if self.ecc_mx is not None else 0,
+                'num_pos_ecc_feats': (self.ecc_mx > 0).nnz
+                        if self.ecc_mx is not None else 0,
+                'num_neg_ecc_feats': (self.ecc_mx < 0).nnz
+                        if self.ecc_mx is not None else 0,
         }
 
         return pred_clustering, metrics
@@ -356,12 +361,22 @@ def simulate(dc_graph: dict):
     for r in range(10):
         pred_clustering, metrics = clusterer.pred()
         metrics['rand_idx'] = rand_idx(gold_clustering, pred_clustering)
+        metric_str = '; '.join([
+            k + ' = ' 
+            + ('{:.4f}'.format(v) if isinstance(v, float) else str(v))
+                for k, v in metrics.items()
+        ])
+        logging.info('Round %d metrics - ' + metric_str, r)
 
+        if metrics['rand_idx'] == 1.0:
+            logging.info('Achieved perfect clustering at round %d.', r)
+            break
+
+        # generate a new constraint
         pred_cluster_feats = sp_vstack([
             get_cluster_feats(point_features[pred_clustering == i])
                 for i in np.unique(pred_clustering)
         ])
-
         ecc_constraint = gen_ecc_constraint(
                 cluster_features,
                 pred_cluster_feats,
@@ -371,14 +386,17 @@ def simulate(dc_graph: dict):
                 feat_freq
         )
 
-        embed()
-        exit()
-
-        # TODO: compute metrics, break if clustering perfect
-        # TODO: generate new ecc constraint
+        # add new constraint
+        clusterer.add_constraint(ecc_constraint)
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+            format='(ecc) :: %(asctime)s >> %(message)s',
+            datefmt='%m-%d-%y %H:%M:%S',
+            level=logging.INFO
+    )
+
     seed = 42
     pl.utilities.seed.seed_everything(seed)
 
