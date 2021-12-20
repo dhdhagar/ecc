@@ -367,9 +367,9 @@ def simulate(dc_graph: dict):
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
-    max_overlap_feats = 2
-    max_pos_feats = 2
-    max_neg_feats = 2
+    max_overlap_feats = 5
+    max_pos_feats = 5
+    max_neg_feats = 5
 
     for r in range(100):
         pred_clustering, metrics = clusterer.pred()

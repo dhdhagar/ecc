@@ -101,7 +101,7 @@ if __name__ == '__main__':
         'cluster_feature_noise': 0.3,
         'point_feature_sample_prob': 0.5,
         'edge_weight_mean': 1.0,
-        'edge_weight_stddev': 1.3,
+        'edge_weight_stddev': 1.5,
     }
     out_fname = 'small_data.pkl'
 
