@@ -89,17 +89,17 @@ if __name__ == '__main__':
     pl.utilities.seed.seed_everything(seed)
 
     metadata = {
-        'num_clusters': 3,
-        'num_points': 15,
-        'data_dim': 12,
+        'num_clusters': 8,
+        'num_points': 40,
+        'data_dim': 24,
         'cluster_feature_noise': 0.3,
         'point_feature_sample_prob': 0.5,
         'edge_weight_mean': 1.0,
         'edge_weight_stddev': 1.3,
     }
-    out_fname = 'tiny_data.pkl'
+    out_fname = 'small_data.pkl'
 
-    tiny_data = gen_synth_data(
+    data = gen_synth_data(
             num_clusters=metadata['num_clusters'],
             num_points=metadata['num_points'],
             data_dim=metadata['data_dim'],
@@ -109,7 +109,9 @@ if __name__ == '__main__':
             edge_weight_stddev=metadata['edge_weight_stddev']
     )
 
-    tiny_data['metadata'] = metadata
+    data['metadata'] = metadata
 
     with open(out_fname, 'wb') as f:
-        pickle.dump(tiny_data, f)
+        print('writing synthetic data with {} to {}'.format(
+            metadata, out_fname))
+        pickle.dump(data, f)

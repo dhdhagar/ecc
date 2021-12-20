@@ -173,10 +173,18 @@ class EccClusterer(object):
     def get_num_ecc_sat(self, leaves: np.ndarray, num_points: int):
         point_leaves = leaves[leaves < num_points]
         ecc_indices = leaves[leaves >= num_points] - num_points
+        if ecc_indices.squeeze().size == 0:
+            return 0
         feats = get_cluster_feats(self.features[point_leaves])
         ecc_avail = self.ecc_mx[ecc_indices]
         to_satisfy = (ecc_avail > 0).sum(axis=1)
-        return ((feats @ ecc_avail.T) == to_satisfy).sum()
+        num_ecc_sat = ((feats @ ecc_avail.T).T == to_satisfy).sum()
+
+        if num_ecc_sat > ecc_indices.size:
+            embed()
+            exit()
+
+        return num_ecc_sat
 
     def cut_trellis(self, t: hg.Tree):
         num_ecc = len(self.ecc_constraints)
@@ -296,9 +304,10 @@ def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
             pred_cluster_feats.indptr, pred_cluster_feats.indices,
             matching_mx
     )
+
     # TODO: maybe replace this next line with softmax instead of uniform?
-    matching_mx = matching_mx / np.sum(matching_mx)
-    pair_ravel_idx = np.where(np.random.multinomial(1, matching_mx.ravel()))
+    norm_matching_mx = matching_mx / np.sum(matching_mx)
+    pair_ravel_idx = np.where(np.random.multinomial(1, norm_matching_mx.ravel()))
     gold_cluster_idx, pred_cluster_idx = np.unravel_index(
             pair_ravel_idx[0][0], matching_mx.shape)
 
@@ -344,12 +353,7 @@ def simulate(dc_graph: dict):
     point_features = dc_graph['point_features']
     cluster_features = dc_graph['cluster_features']
     gold_clustering = dc_graph['labels']
-
     feat_freq = np.array(point_features.sum(axis=0))
-
-    ecc1 = csr_matrix(2*(cluster_features.todense()[0:1]) - 1)
-    ecc2 = csr_matrix(2*(cluster_features.todense()[1:2]) - 1)
-    ecc3 = csr_matrix(2*(cluster_features.todense()[2:3]) - 1)
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
@@ -392,7 +396,7 @@ def simulate(dc_graph: dict):
 
 if __name__ == '__main__':
     logging.basicConfig(
-            format='(ecc) :: %(asctime)s >> %(message)s',
+            format='(ECC) :: %(asctime)s >> %(message)s',
             datefmt='%m-%d-%y %H:%M:%S',
             level=logging.INFO
     )
@@ -400,7 +404,7 @@ if __name__ == '__main__':
     seed = 42
     pl.utilities.seed.seed_everything(seed)
 
-    data_fname = 'tiny_data.pkl'
+    data_fname = 'small_data.pkl'
 
     with open(data_fname, 'rb') as f:
         dc_graph = pickle.load(f)
