@@ -305,8 +305,22 @@ def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
             matching_mx
     )
 
+    # set perfect match rows and columns to zero so they will not be picked
+    perfect_match = (matching_mx == 1.0)
+    row_mask = np.any(perfect_match, axis=1)
+    column_mask = np.any(perfect_match, axis=0)
+    to_zero_mask = row_mask[:, None] | column_mask[None, :]
+    matching_mx[to_zero_mask] = 0.0
+
+    norm_factor = np.sum(matching_mx)
+    if norm_factor == 0.0:
+        logging.info('Features of gold clusters already fully satisfied.'
+                     ' Cannot generate constraints to affect clustering.')
+        logging.info('Exiting...')
+        exit()
+
     # TODO: maybe replace this next line with softmax instead of uniform?
-    norm_matching_mx = matching_mx / np.sum(matching_mx)
+    norm_matching_mx = matching_mx / norm_factor
     pair_ravel_idx = np.where(np.random.multinomial(1, norm_matching_mx.ravel()))
     gold_cluster_idx, pred_cluster_idx = np.unravel_index(
             pair_ravel_idx[0][0], matching_mx.shape)
@@ -358,9 +372,9 @@ def simulate(dc_graph: dict):
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
-    max_overlap_feats = 2
-    max_pos_feats = 2
-    max_neg_feats = 2
+    max_overlap_feats = 4
+    max_pos_feats = 4
+    max_neg_feats = 4
 
     for r in range(10):
         pred_clustering, metrics = clusterer.pred()
