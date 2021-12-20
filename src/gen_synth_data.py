@@ -1,4 +1,5 @@
 from collections import namedtuple
+import math
 import pickle
 import random
 
@@ -32,6 +33,7 @@ def gen_synth_data(num_clusters: int,
     cluster_features = np.vstack(cluster_features)
 
     # generate the points
+    points_per_cluster = math.ceil(num_points / num_clusters)
     for point_idx in range(num_points):
         cluster_idx = point_idx % num_clusters
         point_labels.append(cluster_idx)
@@ -44,6 +46,10 @@ def gen_synth_data(num_clusters: int,
             cluster_feat_idx = cluster_feat_domain[cluster_feat_mask]
             sample_point = np.zeros_like(cluster_features[cluster_idx])
             sample_point[cluster_feat_idx] = 1
+            # enforce distinguishability
+            sample_point[cluster_idx*block_size:(cluster_idx*block_size)+points_per_cluster] = 0
+            sample_point[(cluster_idx*block_size)+(point_idx//num_clusters)] = 1
+
             subsets = np.all(
                     (sample_point & cluster_features) == sample_point,
                     axis=1)
@@ -53,9 +59,9 @@ def gen_synth_data(num_clusters: int,
     point_features = np.vstack(point_features)
     point_labels = np.asarray(point_labels)
 
-    # HACK: cluster reps are exactly the aggregation of all their points
-    #        (no more, no less) -> this way we don't need to add attributes
-    #        which are not present in the points
+    # cluster reps are exactly the aggregation of all their points
+    #  (no more, no less) -> this way we don't need to add attributes which
+    #  are not present in the points
     for cluster_idx in range(num_clusters):
         point_mask = (point_labels == cluster_idx)
         assert np.sum(point_mask) > 0
@@ -91,13 +97,18 @@ if __name__ == '__main__':
     metadata = {
         'num_clusters': 8,
         'num_points': 40,
-        'data_dim': 24,
+        'data_dim': 40,
         'cluster_feature_noise': 0.3,
         'point_feature_sample_prob': 0.5,
         'edge_weight_mean': 1.0,
         'edge_weight_stddev': 1.3,
     }
     out_fname = 'small_data.pkl'
+
+    assert metadata['data_dim'] >= (
+            math.ceil(metadata['num_points'] / metadata['num_clusters'])
+                      * metadata['num_clusters']
+    )
 
     data = gen_synth_data(
             num_clusters=metadata['num_clusters'],

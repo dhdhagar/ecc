@@ -154,7 +154,7 @@ class EccClusterer(object):
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000000)
+        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000)
 
         return np.triu(X.value, k=1)
 
@@ -179,11 +179,6 @@ class EccClusterer(object):
         ecc_avail = self.ecc_mx[ecc_indices]
         to_satisfy = (ecc_avail > 0).sum(axis=1)
         num_ecc_sat = ((feats @ ecc_avail.T).T == to_satisfy).sum()
-
-        if num_ecc_sat > ecc_indices.size:
-            embed()
-            exit()
-
         return num_ecc_sat
 
     def cut_trellis(self, t: hg.Tree):
@@ -372,11 +367,11 @@ def simulate(dc_graph: dict):
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
-    max_overlap_feats = 4
-    max_pos_feats = 4
-    max_neg_feats = 4
+    max_overlap_feats = 2
+    max_pos_feats = 2
+    max_neg_feats = 2
 
-    for r in range(10):
+    for r in range(100):
         pred_clustering, metrics = clusterer.pred()
         metrics['rand_idx'] = rand_idx(gold_clustering, pred_clustering)
         metric_str = '; '.join([
