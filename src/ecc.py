@@ -37,7 +37,7 @@ class EccClusterer(object):
         self.n += 1
 
     @staticmethod
-    @nb.njit(nogil=True, parallel=True)
+    @nb.njit(parallel=True)
     def _set_incompat_mx(n: int,
                          m: int,
                          indptr_a: np.ndarray,
@@ -66,7 +66,7 @@ class EccClusterer(object):
                         ptr_b += 1
 
     @staticmethod
-    @nb.njit(nogil=True)
+    @nb.njit
     def _get_feat_satisfied_hyperplanes(feats_indptr: np.ndarray,
                                         feats_indices: np.ndarray,
                                         pos_ecc_indptr: np.ndarray,
@@ -250,7 +250,7 @@ def get_cluster_feats(point_feats: csr_matrix):
     return csr_matrix((np.diff(csc_indptr) > 0).astype(np.int64))
 
 
-@nb.njit(nogil=True, parallel=True)
+@nb.njit(parallel=True)
 def set_matching_matrix(gold_indptr: np.ndarray,
                         gold_indices: np.ndarray,
                         pred_indptr: np.ndarray,
