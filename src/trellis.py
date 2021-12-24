@@ -135,6 +135,7 @@ class Trellis(object):
         self.n = adj_mx.shape[0]
         self.num_trees = num_trees
         self.noise_lvl = noise_lvl
+        self.topo_order = None
 
     def fit(self):
         # get the HAC tree, not necessarily contained in beam search
@@ -162,6 +163,18 @@ class Trellis(object):
 
         # set some basic variables
         self.num_nodes = self.leaves_indptr.size - 1
+
+    def internal_nodes_topo_ordered(self):
+        if self.topo_order is None:
+            raise ValueError('Topological order has not been set.'
+                             ' Please run `fit()`.')
+        return iter(self.topo_order.tolist())
+
+    def get_child_pairs_iter(self, node_idx: int):
+        for i in range(self.child_pairs_indptr[node_idx],
+                self.child_pairs_indptr[node_idx+1], 2):
+            yield (self.child_pairs_indices[i],
+                   self.child_pairs_indices[i+1])
 
 
 if __name__ == '__main__':

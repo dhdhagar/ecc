@@ -19,6 +19,8 @@ from scipy.sparse import csr_matrix, coo_matrix
 from scipy.sparse import vstack as sp_vstack
 from sklearn.metrics import adjusted_rand_score as rand_idx
 
+from trellis import Trellis
+
 from IPython import embed
 
 
@@ -30,6 +32,7 @@ class EccClusterer(object):
         self.n = self.features.shape[0]
         self.ecc_constraints = []
         self.ecc_mx = None
+        self.incompat_mx = None
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -97,14 +100,15 @@ class EccClusterer(object):
 
         return (ecc_indices, points_indptr, points_indices)
 
-    def solve_sdp(self):
+    def build_and_solve_sdp(self):
         num_points = self.features.shape[0]
         num_ecc = len(self.ecc_constraints)
 
         if num_ecc > 0:
             # "negative" sdp constraints
             uni_feats = sp_vstack([self.features, self.ecc_mx])
-            incompat_mx = np.zeros((num_points+num_ecc, num_ecc), dtype=bool)
+            self.incompat_mx = np.zeros(
+                    (num_points+num_ecc, num_ecc), dtype=bool)
             self._set_incompat_mx(num_points+num_ecc,
                                   num_ecc,
                                   uni_feats.indptr,
@@ -113,9 +117,9 @@ class EccClusterer(object):
                                   self.ecc_mx.indptr,
                                   self.ecc_mx.indices,
                                   self.ecc_mx.data,
-                                  incompat_mx)
+                                  self.incompat_mx)
             ortho_indices = [(a, b+num_points)
-                    for a, b in zip(*np.where(incompat_mx))]
+                    for a, b in zip(*np.where(self.incompat_mx))]
 
             # "positive" sdp constraints
             bin_features = self.features.astype(bool).tocsc()
@@ -127,7 +131,7 @@ class EccClusterer(object):
                      bin_features.indices,
                      pos_ecc_mx.indptr,
                      pos_ecc_mx.indices,
-                     incompat_mx)
+                     self.incompat_mx)
             ecc_indices = [x + num_points for x in ecc_indices]
             points_indptr = list(points_indptr)
             points_indices = list(points_indices)
@@ -156,12 +160,18 @@ class EccClusterer(object):
         logging.info('Solving optimization problem')
         prob.solve(solver=cp.SCS, verbose=True, max_iters=25000)
 
-        return np.triu(X.value, k=1)
+        pw_probs = X.value
+        if self.incompat_mx is not None:
+            # discourage incompatible nodes from clustering together
+            pw_probs = pw_probs[self.incompat_mx] - np.sum(pw_probs)
+        pw_probs = np.triu(pw_probs, k=1)
+        return pw_probs
 
-    def build_trellis(self, X: np.ndarray):
-        pp_graph, pp_edge_weights = hg.adjacency_matrix_2_undirected_graph(X)
-        t, _ = hg.binary_partition_tree_average_linkage(
-                pp_graph, 1.0-pp_edge_weights)
+    def build_trellis(self, pw_probs: np.ndarray):
+        num_trees = 5
+        noise_lvl = 0.1
+        t = Trellis(adj_mx=pw_probs, num_trees=num_trees, noise_lvl=noise_lvl)
+        t.fit()
         return t
 
     def get_intra_cluster_energy(self, leaves: np.ndarray):
@@ -181,48 +191,60 @@ class EccClusterer(object):
         num_ecc_sat = ((feats @ ecc_avail.T).T == to_satisfy).sum()
         return num_ecc_sat
 
-    def cut_trellis(self, t: hg.Tree):
+    @staticmethod
+    @nb.njit(parallel=True)
+    def get_membership_data(indptr: np.ndarray,
+                            indices: np.ndarray):
+        data = np.empty(indices.shape, dtype=np.int64)
+        for i in nb.prange(indptr.size-1):
+            for j in nb.prange(indptr[i], indptr[i+1]):
+                data[j] = i
+        return data
+
+    def cut_trellis(self, t: Trellis):
         num_ecc = len(self.ecc_constraints)
         num_points = self.n - num_ecc
-        parents = t.parents()
-        membership = copy.deepcopy(parents[:self.n])
-        best_clustering = np.arange(self.n)
-        obj_vals = np.zeros((2*self.n - 1,))
-        num_ecc_sat = np.zeros((2*self.n - 1,))
 
-        for node in t.leaves_to_root_iterator(
-                include_leaves=False, include_root=True):
-            leaves_mask = (membership == node)
-            leaves = np.where(leaves_mask)[0]
+        membership_indptr = t.leaves_indptr
+        membership_indices = t.leaves_indices
+        membership_data = self.get_membership_data(membership_indptr,
+                                                   membership_indices)
+        obj_vals = np.zeros((t.num_nodes,))
+        num_ecc_sat = np.zeros((t.num_nodes,))
+
+        for node in t.internal_nodes_topo_ordered():
+            leaves = membership_indices[membership_indptr[node]:
+                                        membership_indptr[node+1]]
             if num_ecc > 0:
                 num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_points)
             obj_vals[node] = self.get_intra_cluster_energy(leaves)
-            curr_num_ecc_sat = sum([num_ecc_sat[i] 
-                for i in np.unique(best_clustering[leaves_mask])])
-            curr_obj_val = sum([obj_vals[i] 
-                for i in np.unique(best_clustering[leaves_mask])])
-            if (num_ecc_sat[node] > curr_num_ecc_sat 
-                or (num_ecc_sat[node] == curr_num_ecc_sat
-                    and obj_vals[node] > curr_obj_val)):
-                best_clustering[leaves_mask] = node
-            membership[leaves_mask] = parents[node]
 
-        obj_value = sum([obj_vals[i] for i in np.unique(best_clustering)])
-        num_ecc_satisfied = int(sum([num_ecc_sat[i]
-                for i in np.unique(best_clustering)]))
+            for lchild, rchild in t.get_child_pairs_iter(node):
+                chp_num_ecc_sat = num_ecc_sat[lchild] + num_ecc_sat[rchild]
+                chp_obj_val = obj_vals[lchild] + obj_vals[rchild]
+                if (num_ecc_sat[node] > chp_num_ecc_sat 
+                    or (num_ecc_sat[node] == chp_num_ecc_sat
+                        and obj_vals[node] > chp_obj_val)):
+                    num_ecc_sat[node] = chp_num_ecc_sat
+                    obj_vals[node] = chp_obj_val
+                    # TODO: update membership_data
+                    embed()
+                    exit()
 
-        return best_clustering[:num_points], obj_value, num_ecc_satisfied
+        best_clustering = membership_data[-(num_points+num_ecc):-num_ecc]
+
+        return best_clustering, obj_vals[-1], num_ecc_satisfied[-1]
 
     def pred(self):
         num_ecc = len(self.ecc_constraints)
 
         # Construct and solve SDP
         start_solve_time = time.time()
-        X_hat = self.solve_sdp()
+        pw_probs = self.build_and_solve_sdp()
         end_solve_time = time.time()
 
         # Build trellis
-        t = self.build_trellis(X_hat)
+        t = self.build_trellis(pw_probs)
 
         # Cut trellis
         pred_clustering, obj_value, num_ecc_satisfied = self.cut_trellis(t)
