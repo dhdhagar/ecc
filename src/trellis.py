@@ -12,7 +12,7 @@ from sklearn.metrics import adjusted_rand_score as rand_idx
 from IPython import embed
 
 
-@nb.njit
+#@nb.njit
 def get_trellis_node_id(
         leaves_indptr: np.ndarray,
         leaves_indices: np.ndarray,
@@ -42,7 +42,7 @@ def get_trellis_node_id(
     return node_id, leaves_indptr, leaves_indices
 
 
-@nb.njit
+#@nb.njit
 def build_trellis_from_trees(trees: np.ndarray):
     num_trees = trees.shape[0]
     num_tree_nodes = trees.shape[1]

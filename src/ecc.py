@@ -163,7 +163,11 @@ class EccClusterer(object):
         pw_probs = X.value
         if self.incompat_mx is not None:
             # discourage incompatible nodes from clustering together
-            pw_probs = pw_probs[self.incompat_mx] - np.sum(pw_probs)
+            self.incompat_mx = np.concatenate(
+                    (np.zeros((num_points+num_ecc, num_points), dtype=bool),
+                     self.incompat_mx), axis=1
+            )
+            pw_probs[self.incompat_mx] -= np.sum(pw_probs)
         pw_probs = np.triu(pw_probs, k=1)
         return pw_probs
 
@@ -192,17 +196,17 @@ class EccClusterer(object):
         return num_ecc_sat
 
     @staticmethod
-    @nb.njit(parallel=True)
+    #@nb.njit(parallel=True)
     def get_membership_data(indptr: np.ndarray,
                             indices: np.ndarray):
         data = np.empty(indices.shape, dtype=np.int64)
-        for i in nb.prange(indptr.size-1):
-            for j in nb.prange(indptr[i], indptr[i+1]):
+        for i in range(indptr.size-1):
+            for j in range(indptr[i], indptr[i+1]):
                 data[j] = i
         return data
 
     @staticmethod
-    @nb.njit
+    #@nb.njit
     def merge_memberships(lchild_indices: np.ndarray,
                           lchild_data: np.ndarray,
                           rchild_indices: np.ndarray,
@@ -216,15 +220,16 @@ class EccClusterer(object):
         lchild_ptr = 0
         rchild_ptr = 0
         for i in range(parent_data.size):
-            if ((lchild_ptr < lchild_indices.size and
-                    lchild_indices[lchild_ptr] < rchild_indices[rchild_ptr])
-                  or rchild_ptr == rchild_indices.size):
+            if (rchild_ptr == rchild_indices.size or
+                    (lchild_ptr < lchild_indices.size and
+                     lchild_indices[lchild_ptr] < rchild_indices[rchild_ptr])):
                 assert parent_indices[i] == lchild_indices[lchild_ptr]
                 parent_data[i] = lchild_data[lchild_ptr]
                 lchild_ptr += 1
             else:
                 assert parent_indices[i] == rchild_indices[rchild_ptr]
-                assert lchild_indices[lchild_ptr] != rchild_indices[rchild_ptr]
+                assert (lchild_ptr == lchild_indices.size
+                        or lchild_indices[lchild_ptr] != rchild_indices[rchild_ptr])
                 parent_data[i] = rchild_data[rchild_ptr]
                 rchild_ptr += 1
 
@@ -267,12 +272,15 @@ class EccClusterer(object):
                             membership_data[node_start:node_end],
                     )
 
-        embed()
-        exit()
+        best_clustering = membership_data[node_start:node_end]
+        if num_ecc > 0:
+            best_clustering = best_clustering[:-num_ecc]
 
-        best_clustering = membership_data[-(num_points+num_ecc):-num_ecc]
+        # TODO: fix num_ecc_sat
+        # TODO: fix obj_vals
+        # These are both wrong under the root Trellis assumption
 
-        return best_clustering, obj_vals[-1], num_ecc_satisfied[-1]
+        return best_clustering, obj_vals[-1], num_ecc_sat[-1]
 
     def pred(self):
         num_ecc = len(self.ecc_constraints)
@@ -428,9 +436,9 @@ def simulate(dc_graph: dict):
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
-    max_overlap_feats = 5
-    max_pos_feats = 5
-    max_neg_feats = 5
+    max_overlap_feats = 2
+    max_pos_feats = 2
+    max_neg_feats = 2
 
     for r in range(100):
         pred_clustering, metrics = clusterer.pred()
