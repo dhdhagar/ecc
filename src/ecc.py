@@ -172,8 +172,8 @@ class EccClusterer(object):
         return pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
-        num_trees = 1
-        noise_lvl = 0.1
+        num_trees = 10
+        noise_lvl = 0.2
         t = Trellis(adj_mx=pw_probs, num_trees=num_trees, noise_lvl=noise_lvl)
         t.fit()
         return t
@@ -196,17 +196,17 @@ class EccClusterer(object):
         return num_ecc_sat
 
     @staticmethod
-    #@nb.njit(parallel=True)
+    @nb.njit(parallel=True)
     def get_membership_data(indptr: np.ndarray,
                             indices: np.ndarray):
         data = np.empty(indices.shape, dtype=np.int64)
-        for i in range(indptr.size-1):
-            for j in range(indptr[i], indptr[i+1]):
+        for i in nb.prange(indptr.size-1):
+            for j in nb.prange(indptr[i], indptr[i+1]):
                 data[j] = i
         return data
 
     @staticmethod
-    #@nb.njit
+    @nb.njit
     def merge_memberships(lchild_indices: np.ndarray,
                           lchild_data: np.ndarray,
                           rchild_indices: np.ndarray,

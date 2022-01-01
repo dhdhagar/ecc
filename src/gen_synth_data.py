@@ -95,9 +95,9 @@ if __name__ == '__main__':
     pl.utilities.seed.seed_everything(seed)
 
     metadata = {
-        'num_clusters': 3,
-        'num_points': 15,
-        'data_dim': 45,
+        'num_clusters': 8,
+        'num_points': 40,
+        'data_dim': 40,
         'cluster_feature_noise': 0.3,
         'point_feature_sample_prob': 0.5,
         'edge_weight_mean': 1.0,
