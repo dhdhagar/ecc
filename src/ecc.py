@@ -172,7 +172,7 @@ class EccClusterer(object):
         return pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
-        num_trees = 5
+        num_trees = 1
         noise_lvl = 0.1
         t = Trellis(adj_mx=pw_probs, num_trees=num_trees, noise_lvl=noise_lvl)
         t.fit()
@@ -272,15 +272,15 @@ class EccClusterer(object):
                             membership_data[node_start:node_end],
                     )
 
+        # The value of `node` is the root since we iterate over the trellis
+        # nodes in topological order bottom up. Moreover, the values of
+        # `node_start` and `node_end` also correspond to the root of the
+        # trellis.
         best_clustering = membership_data[node_start:node_end]
         if num_ecc > 0:
             best_clustering = best_clustering[:-num_ecc]
 
-        # TODO: fix num_ecc_sat
-        # TODO: fix obj_vals
-        # These are both wrong under the root Trellis assumption
-
-        return best_clustering, obj_vals[-1], num_ecc_sat[-1]
+        return best_clustering, obj_vals[node], num_ecc_sat[node]
 
     def pred(self):
         num_ecc = len(self.ecc_constraints)
@@ -436,9 +436,9 @@ def simulate(dc_graph: dict):
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
-    max_overlap_feats = 2
-    max_pos_feats = 2
-    max_neg_feats = 2
+    max_overlap_feats = 5
+    max_pos_feats = 5
+    max_neg_feats = 5
 
     for r in range(100):
         pred_clustering, metrics = clusterer.pred()
