@@ -144,12 +144,21 @@ class Trellis(object):
         hac_tree, _ = hg.binary_partition_tree_average_linkage(g, dists)
 
         trees = [hac_tree.parents()]
-        for _ in range(self.num_trees-1):
+
+        trees += [
+            hg.binary_partition_tree_single_linkage(g, dists)[0].parents(),
+            hg.binary_partition_tree_complete_linkage(g, dists)[0].parents(),
+            hg.binary_partition_tree_exponential_linkage(g, dists, -1.0)[0].parents(),
+            hg.binary_partition_tree_exponential_linkage(g, dists, 1.0)[0].parents()
+        ]
+
+        for _ in range(self.num_trees-5):
             noise = np.random.normal(
                     loc=0.0, scale=self.noise_lvl, size=dists.shape)
             noise_tree, _ = hg.binary_partition_tree_average_linkage(
                     g, dists+noise)
             trees.append(noise_tree.parents())
+
         trees = np.vstack(trees)
 
         # build trellis

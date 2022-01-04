@@ -5,6 +5,7 @@
 #
 
 import copy
+from itertools import product
 import logging
 import pickle
 import time
@@ -15,8 +16,9 @@ import numba as nb
 from numba.typed import List
 import numpy as np
 import pytorch_lightning as pl
-from scipy.sparse import csr_matrix, coo_matrix
+from scipy.sparse import csr_matrix, coo_matrix, dok_matrix
 from scipy.sparse import vstack as sp_vstack
+from scipy.special import softmax
 from sklearn.metrics import adjusted_rand_score as rand_idx
 
 from trellis import Trellis
@@ -172,8 +174,8 @@ class EccClusterer(object):
         return pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
-        num_trees = 10
-        noise_lvl = 0.2
+        num_trees = 5
+        noise_lvl = 0.05
         t = Trellis(adj_mx=pw_probs, num_trees=num_trees, noise_lvl=noise_lvl)
         t.fit()
         return t
@@ -353,21 +355,18 @@ def set_matching_matrix(gold_indptr: np.ndarray,
     return matching_mx
 
 
-def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
+def gen_ecc_constraint(point_feats: csr_matrix,
+                       gold_cluster_lbls: np.ndarray,
+                       pred_cluster_lbls: np.ndarray,
+                       gold_cluster_feats: csr_matrix,
                        pred_cluster_feats: csr_matrix,
+                       matching_mx: np.ndarray,
                        max_overlap_feats: int,
                        max_pos_feats: int,
                        max_neg_feats: int,
-                       feat_freq: np.ndarray,
-                       feat_select_strategy: str = 'uniform'):
-    # pick a pred cluster and target gold cluster
-    matching_mx = np.empty((gold_cluster_feats.shape[0],
-                            pred_cluster_feats.shape[0]))
-    set_matching_matrix(
-            gold_cluster_feats.indptr, gold_cluster_feats.indices,
-            pred_cluster_feats.indptr, pred_cluster_feats.indices,
-            matching_mx
-    )
+                       overlap_col_wt: np.ndarray,
+                       pos_col_wt: np.ndarray,
+                       neg_col_wt: np.ndarray):
 
     # set perfect match rows and columns to zero so they will not be picked
     perfect_match = (matching_mx == 1.0)
@@ -383,9 +382,10 @@ def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
         logging.info('Exiting...')
         exit()
 
-    # TODO: maybe replace this next line with softmax instead of uniform?
+    # pick a gold cluster, pred cluster pair
     norm_matching_mx = matching_mx / norm_factor
-    pair_ravel_idx = np.where(np.random.multinomial(1, norm_matching_mx.ravel()))
+    pair_ravel_idx = np.where(
+            np.random.multinomial(1, norm_matching_mx.ravel()))
     gold_cluster_idx, pred_cluster_idx = np.unravel_index(
             pair_ravel_idx[0][0], matching_mx.shape)
 
@@ -396,18 +396,23 @@ def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
     all_pos_feats = ((tgt_feats - src_feats) == 1).astype(np.int64)
     all_neg_feats = ((src_feats - tgt_feats) == 1).astype(np.int64)
 
-    # TODO: implement different feature selection strategies based on feat_freq
-    assert feat_select_strategy == 'uniform'
-
-    def sample_csr_cols(mx, num_sample, p=None):
+    def sample_csr_cols(mx, num_sample, col_wt=None):
         choices = mx.tocoo().col
         k = min(num_sample, choices.size)
-        return np.random.choice(choices, (k,), replace=False, p=p)
+        if k > num_sample:
+            p = col_wt[choices]**1
+            p /= np.sum(p)
+        else:
+            p = None
+        samples = np.random.choice(choices, (k,), replace=False, p=p)
+        return samples
 
     sampled_overlap_feats = sample_csr_cols(
-            all_overlap_feats, max_overlap_feats)
-    sampled_pos_feats = sample_csr_cols(all_pos_feats, max_pos_feats)
-    sampled_neg_feats = sample_csr_cols(all_neg_feats, max_neg_feats)
+            all_overlap_feats, max_overlap_feats, col_wt=overlap_col_wt)
+    sampled_pos_feats = sample_csr_cols(
+            all_pos_feats, max_pos_feats, col_wt=pos_col_wt)
+    sampled_neg_feats = sample_csr_cols(
+            all_neg_feats, max_neg_feats, col_wt=neg_col_wt)
 
     new_ecc_col = np.hstack(
             (sampled_overlap_feats,
@@ -423,25 +428,95 @@ def gen_ecc_constraint(gold_cluster_feats: csr_matrix,
 
     new_ecc = coo_matrix((new_ecc_data, (new_ecc_row, new_ecc_col)),
                          shape=src_feats.shape, dtype=np.int64).tocsr()
-    return new_ecc
+
+    # generate "equivalent" pairwise point constraints
+    overlap_feats = set(sampled_overlap_feats)
+    pos_feats = set(sampled_pos_feats)
+    neg_feats = set(sampled_neg_feats)
+
+    gold_cluster_points = set(np.where(gold_cluster_lbls==gold_cluster_idx)[0])
+    pred_cluster_points = set(np.where(pred_cluster_lbls==pred_cluster_idx)[0])
+
+    gold_and_pred = gold_cluster_points & pred_cluster_points
+    gold_not_pred = gold_cluster_points - pred_cluster_points
+    pred_not_gold = pred_cluster_points - gold_cluster_points
+
+    num_points = point_feats.shape[0]
+    pairwise_constraints = dok_matrix((num_points, num_points))
+    for s, t in product(gold_and_pred, gold_not_pred):
+        s_feats = set(point_feats[s].indices)
+        t_feats = set(point_feats[t].indices)
+        if not (s_feats.isdisjoint(overlap_feats) 
+                or t_feats.isdisjoint(overlap_feats)
+                or t_feats.isdisjoint(pos_feats)):
+            if s < t:
+                pairwise_constraints[s, t] = 1
+            else:
+                pairwise_constraints[t, s] = 1
+
+    for s, t in product(gold_and_pred, pred_not_gold):
+        s_feats = set(point_feats[s].indices)
+        t_feats = set(point_feats[t].indices)
+        if not (s_feats.isdisjoint(overlap_feats) 
+                or t_feats.isdisjoint(overlap_feats)
+                or t_feats.isdisjoint(neg_feats)):
+            if s < t:
+                pairwise_constraints[s, t] = -1
+            else:
+                pairwise_constraints[t, s] = -1
+
+    return new_ecc, pairwise_constraints
 
 
 def simulate(dc_graph: dict):
     edge_weights = dc_graph['edge_weights']
     point_features = dc_graph['point_features']
-    cluster_features = dc_graph['cluster_features']
+    gold_cluster_feats = dc_graph['cluster_features']
     gold_clustering = dc_graph['labels']
-    feat_freq = np.array(point_features.sum(axis=0))
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
+    # TODO: move these to hparams
     max_overlap_feats = 5
     max_pos_feats = 5
     max_neg_feats = 5
 
+    ## create column weights
+    # for now just do some uniform feature sampling
+    feat_freq = np.array(point_features.sum(axis=0))
+    overlap_col_wt = np.ones((point_features.shape[1],))
+    pos_col_wt = np.ones((point_features.shape[1],))
+    neg_col_wt = np.ones((point_features.shape[1],))
+    #overlap_col_wt = feat_freq
+    #pos_col_wt = feat_freq
+    #neg_col_wt = feat_freq
+
     for r in range(100):
+        # compute predicted clustering
         pred_clustering, metrics = clusterer.pred()
+
+        # get predicted cluster feats and do some label remapping for later
+        uniq_pred_cluster_lbls = np.unique(pred_clustering)
+        pred_cluster_feats = sp_vstack([
+            get_cluster_feats(point_features[pred_clustering == i])
+                for i in uniq_pred_cluster_lbls
+        ])
+        remap_lbl_dict = {j: i for i, j in enumerate(uniq_pred_cluster_lbls)}
+        for i in range(pred_clustering.size):
+            pred_clustering[i] = remap_lbl_dict[pred_clustering[i]]
+
+        # construct jaccard similarity matching matrix
+        matching_mx = np.empty((gold_cluster_feats.shape[0],
+                                pred_cluster_feats.shape[0]))
+        set_matching_matrix(
+                gold_cluster_feats.indptr, gold_cluster_feats.indices,
+                pred_cluster_feats.indptr, pred_cluster_feats.indices,
+                matching_mx
+        )
+
+        # handle some metric stuffs
+        metrics['match_feat_coeff'] = np.mean(np.max(matching_mx, axis=1))
         metrics['rand_idx'] = rand_idx(gold_clustering, pred_clustering)
         metric_str = '; '.join([
             k + ' = ' 
@@ -450,22 +525,26 @@ def simulate(dc_graph: dict):
         ])
         logging.info('Round %d metrics - ' + metric_str, r)
 
+        # exit if we predict the ground truth clustering
         if metrics['rand_idx'] == 1.0:
+            assert metrics['match_feat_coeff'] == 1.0
             logging.info('Achieved perfect clustering at round %d.', r)
             break
 
         # generate a new constraint
-        pred_cluster_feats = sp_vstack([
-            get_cluster_feats(point_features[pred_clustering == i])
-                for i in np.unique(pred_clustering)
-        ])
-        ecc_constraint = gen_ecc_constraint(
-                cluster_features,
+        ecc_constraint, pairwise_constraints = gen_ecc_constraint(
+                point_features,
+                gold_clustering,
+                pred_clustering,
+                gold_cluster_feats,
                 pred_cluster_feats,
+                matching_mx,
                 max_overlap_feats,
                 max_pos_feats,
                 max_neg_feats,
-                feat_freq
+                overlap_col_wt,
+                pos_col_wt,
+                neg_col_wt
         )
 
         # add new constraint
