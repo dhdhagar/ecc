@@ -132,7 +132,6 @@ dependencies:
     - cvxpy==1.1.17
     - cymem==2.0.6
     - ecos==2.0.7.post1
-    - en-core-web-sm==3.2.0
     - faiss-cpu==1.7.1.post2
     - higra==0.6.4
     - idna==3.3
@@ -148,8 +147,6 @@ dependencies:
     - qdldl==0.1.5.post0
     - setuptools==59.5.0
     - smart-open==5.2.1
-    - spacy-legacy==3.0.8
-    - spacy-loggers==1.0.1
     - srsly==2.4.2
     - thinc==8.0.13
     - typer==0.4.0
