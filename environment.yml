@@ -128,8 +128,6 @@ dependencies:
   - pip:
     - blis==0.7.5
     - catalogue==2.0.6
-    - cvxopt==1.2.7
-    - cvxpy==1.1.17
     - cymem==2.0.6
     - ecos==2.0.7.post1
     - faiss-cpu==1.7.1.post2
