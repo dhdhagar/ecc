@@ -160,7 +160,7 @@ class EccClusterer(object):
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        prob.solve(solver=cp.SCS, verbose=True, max_iters=25000)
+        sdp_obj_value = prob.solve(solver=cp.SCS, verbose=True, max_iters=50000)
 
         pw_probs = X.value
         if self.incompat_mx is not None:
@@ -171,7 +171,7 @@ class EccClusterer(object):
             )
             pw_probs[self.incompat_mx] -= np.sum(pw_probs)
         pw_probs = np.triu(pw_probs, k=1)
-        return pw_probs
+        return sdp_obj_value, pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
         num_trees = 5
@@ -289,19 +289,20 @@ class EccClusterer(object):
 
         # Construct and solve SDP
         start_solve_time = time.time()
-        pw_probs = self.build_and_solve_sdp()
+        sdp_obj_value, pw_probs = self.build_and_solve_sdp()
         end_solve_time = time.time()
 
         # Build trellis
         t = self.build_trellis(pw_probs)
 
         # Cut trellis
-        pred_clustering, obj_value, num_ecc_satisfied = self.cut_trellis(t)
+        pred_clustering, cut_obj_value, num_ecc_satisfied = self.cut_trellis(t)
 
         metrics = {
                 'sdp_solve_time': end_solve_time - start_solve_time,
-                'obj_value': obj_value,
-                'num_ecc_satisfied': num_ecc_satisfied,
+                'sdp_obj_value': sdp_obj_value,
+                'cut_obj_value': cut_obj_value,
+                'num_ecc_satisfied': int(num_ecc_satisfied),
                 'num_ecc': num_ecc,
                 'frac_ecc_satisfied': num_ecc_satisfied / num_ecc
                         if num_ecc > 0 else 0.0,
@@ -532,20 +533,28 @@ def simulate(dc_graph: dict):
             break
 
         # generate a new constraint
-        ecc_constraint, pairwise_constraints = gen_ecc_constraint(
-                point_features,
-                gold_clustering,
-                pred_clustering,
-                gold_cluster_feats,
-                pred_cluster_feats,
-                matching_mx,
-                max_overlap_feats,
-                max_pos_feats,
-                max_neg_feats,
-                overlap_col_wt,
-                pos_col_wt,
-                neg_col_wt
-        )
+        while True:
+            ecc_constraint, pairwise_constraints = gen_ecc_constraint(
+                    point_features,
+                    gold_clustering,
+                    pred_clustering,
+                    gold_cluster_feats,
+                    pred_cluster_feats,
+                    matching_mx,
+                    max_overlap_feats,
+                    max_pos_feats,
+                    max_neg_feats,
+                    overlap_col_wt,
+                    pos_col_wt,
+                    neg_col_wt
+            )
+            already_exists = any([
+                (ecc_constraint != x).nnz == 0
+                for x in clusterer.ecc_constraints
+            ])
+            if not already_exists:
+                break
+            logging.warning('Produced duplicate ecc constraint')
 
         # add new constraint
         clusterer.add_constraint(ecc_constraint)
