@@ -144,7 +144,7 @@ class EccClusterer(object):
                         (self.edge_weights.row, self.edge_weights.col)),
                         shape=(self.n, self.n))
         X = cp.Variable((self.n, self.n), PSD=True)
-        # standard correlation clustering constraintsj
+        # standard correlation clustering constraints
         constraints = [
                 cp.diag(X) == np.ones((self.n,)),
                 X >= 0
@@ -469,19 +469,22 @@ def gen_ecc_constraint(point_feats: csr_matrix,
     return new_ecc, pairwise_constraints
 
 
-def simulate(dc_graph: dict):
-    edge_weights = dc_graph['edge_weights']
-    point_features = dc_graph['point_features']
-    gold_cluster_feats = dc_graph['cluster_features']
-    gold_clustering = dc_graph['labels']
+def simulate(edge_weights: csr_matrix,
+             point_features: csr_matrix,
+             gold_clustering: np.ndarray):
+
+    gold_cluster_feats = sp_vstack([
+        get_cluster_feats(point_features[gold_clustering == i])
+            for i in np.unique(gold_clustering)
+    ])
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features)
 
     # TODO: move these to hparams
-    max_overlap_feats = 5
-    max_pos_feats = 5
-    max_neg_feats = 5
+    max_overlap_feats = 100
+    max_pos_feats = 100
+    max_neg_feats = 100
 
     ## create column weights
     # for now just do some uniform feature sampling
@@ -570,9 +573,23 @@ if __name__ == '__main__':
     seed = 42
     pl.utilities.seed.seed_everything(seed)
 
-    data_fname = 'small_data.pkl'
-
+    data_fname = '../data/pubmed_processed.pkl'
     with open(data_fname, 'rb') as f:
-        dc_graph = pickle.load(f)
+        blocks_preprocessed = pickle.load(f)
 
-    simulate(dc_graph)
+    for block_name, block_data in blocks_preprocessed.items():
+        edge_weights = block_data['edge_weights']
+        point_features = block_data['point_features']
+        gold_clustering = block_data['labels']
+
+        assert edge_weights.shape[0] == point_features.shape[0]
+        num_clusters = np.unique(gold_clustering).size
+
+        logging.info(f'Loaded block \"{block_name}\"')
+        logging.info(f'\t number of points: {edge_weights.shape[0]}')
+        logging.info(f'\t number of clusters: {num_clusters}')
+        logging.info(f'\t number of features: {point_features.shape[1]}')
+
+        simulate(edge_weights, point_features, gold_clustering)
+
+
