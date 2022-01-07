@@ -9,6 +9,7 @@ import copy
 from itertools import product
 import json
 import logging
+import os
 import pickle
 import time
 
@@ -614,13 +615,30 @@ def get_hparams():
 
 if __name__ == '__main__':
 
-    logging.basicConfig(
-            format='(ECC) :: %(asctime)s >> %(message)s',
-            datefmt='%m-%d-%y %H:%M:%S',
-            level=logging.INFO
-    )
-
     hparams = get_hparams()
+
+    if not hparams.debug:
+        # create output directory
+        assert not os.path.exists(hparams.output_dir)
+        os.makedirs(hparams.output_dir)
+
+        # dump hparams
+        pickle.dump(
+                hparams, 
+                open(os.path.join(hparams.output_dir, 'hparams.pkl'), "wb")
+        )
+        logging.basicConfig(
+                filename=os.path.join(hparams.output_dir, 'out.log'),
+                format='(ECC) :: %(asctime)s >> %(message)s',
+                datefmt='%m-%d-%y %H:%M:%S',
+                level=logging.INFO
+        )
+    else:
+        logging.basicConfig(
+                format='(ECC) :: %(asctime)s >> %(message)s',
+                datefmt='%m-%d-%y %H:%M:%S',
+                level=logging.INFO
+        )
 
     logging.info('Experiment args:\n{}'.format(
         json.dumps(vars(hparams), sort_keys=True, indent=4)))
@@ -631,6 +649,8 @@ if __name__ == '__main__':
         logging.info('Loading preprocessed data.')
         blocks_preprocessed = pickle.load(f)
 
+    ecc_for_replay = {}
+    mlcl_for_replay = {}
     num_blocks = len(blocks_preprocessed)
     for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
@@ -645,7 +665,7 @@ if __name__ == '__main__':
         logging.info(f'\t number of clusters: {num_clusters}')
         logging.info(f'\t number of features: {point_features.shape[1]}')
 
-        ecc_constraints_for_replay, pairwise_constraints_for_replay = simulate(
+        block_ecc_for_replay, block_mlcl_for_replay = simulate(
                 edge_weights,
                 point_features,
                 gold_clustering,
@@ -655,3 +675,13 @@ if __name__ == '__main__':
                 hparams.max_pos_feats,
                 hparams.max_neg_feats
         )
+
+        ecc_for_replay[block_name] = block_ecc_for_replay
+        mlcl_for_replay[block_name] = block_mlcl_for_replay
+
+    if not hparams.debug:
+        logging.info('Dumping ecc and mlcl constraints for replay')
+        ecc_fname = os.path.join(hparams.output_dir, 'ecc_for_replay.pkl')
+        mlcl_fname = os.path.join(hparams.output_dir, 'mlcl_for_replay.pkl')
+        pickle.dump(ecc_for_replay, open(ecc_fname, 'wb'))
+        pickle.dump(mlcl_for_replay, open(mlcl_fname, 'wb'))
