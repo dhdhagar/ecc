@@ -38,34 +38,39 @@ class MLCLClusterer(object):
                  edge_weights: csr_matrix,
                  max_sdp_iters: int):
 
-        self.edge_weights = edge_weights.tocoo()
+        self.edge_weights = copy.deepcopy(edge_weights)
+        self.large_num = np.sum(np.abs(edge_weights.data))
         self.max_sdp_iters = max_sdp_iters
         self.n = self.edge_weights.shape[0]
         self.mlcl_constraints = []
 
     def add_constraint(self, mlcl_constraint: Tuple[int, int, int]):
+        i, j, s = mlcl_constraint
+        assert s in [-1, 1]
+        self.edge_weights[i, j] = s * self.large_num
         self.mlcl_constraints.append(mlcl_constraint)
 
     def build_and_solve_sdp(self):
         # formulate SDP
         logging.info('Constructing optimization problem')
-        W = csr_matrix((self.edge_weights.data,
-                        (self.edge_weights.row, self.edge_weights.col)),
-                        shape=(self.n, self.n))
+
+        W = self.edge_weights
         X = cp.Variable((self.n, self.n), PSD=True)
         # standard correlation clustering constraints
         constraints = [
                 cp.diag(X) == np.ones((self.n,)),
                 X >= 0
         ]
-        # add must-link and cannot-link constraints
-        for i, j, s in self.mlcl_constraints:
-            if s == 1:
-                constraints.append(X[i,j] >= 1)
-            elif s == -1:
-                constraint.append(X[i,j] <= 0)
-            else:
-                raise ValueError('Invalid sign value in mlcl constraint.')
+        ## add must-link and cannot-link constraints
+        #for i, j, s in self.mlcl_constraints:
+        #    if s == 1:
+        #        constraints.append(X[i,j] >= 1)
+        #        constraints.append(X[j,i] >= 1)
+        #    elif s == -1:
+        #        constraint.append(X[i,j] <= 0)
+        #        constraint.append(X[j,i] <= 0)
+        #    else:
+        #        raise ValueError('Invalid sign value in mlcl constraint.')
         
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
@@ -127,6 +132,9 @@ class MLCLClusterer(object):
                 rchild_ptr += 1
 
     def cut_trellis(self, t: Trellis):
+        # convert to coo for this function
+        self.edge_weights = self.edge_weights.tocoo()
+
         membership_indptr = t.leaves_indptr
         membership_indices = t.leaves_indices
         membership_data = self.get_membership_data(membership_indptr,
@@ -161,7 +169,15 @@ class MLCLClusterer(object):
         # trellis.
         best_clustering = membership_data[node_start:node_end]
 
-        # TODO: make sure all mlcl constraints are satisfied
+        # make sure all mlcl constraints are satisfied
+        for i, j, s in self.mlcl_constraints:
+            if s == 1:
+                assert best_clustering[i] == best_clustering[j]
+            else:
+                assert best_clustering[i] != best_clustering[j]
+
+        # convert back to csr for the rest of the class
+        self.edge_weights = self.edge_weights.tocsr()
 
         return best_clustering, obj_vals[node]
 
@@ -225,10 +241,34 @@ def set_matching_matrix(gold_indptr: np.ndarray,
             matching_mx[i, j] = num_intersect / num_union
     return matching_mx
 
+
 def gen_mlcl_constraint(gold_cluster_lbls: np.ndarray,
                         pred_cluster_lbls: np.ndarray,
                         point_feats: csr_matrix):
-    pass
+    pred_same_cluster = (pred_cluster_lbls[:, None]
+                         == pred_cluster_lbls[None, :])
+    gold_same_cluster = (gold_cluster_lbls[:, None]
+                         == gold_cluster_lbls[None, :])
+    incorrect_pairs = (pred_same_cluster != gold_same_cluster)
+    incorrect_pairs = np.triu(incorrect_pairs, k=1).astype(float)
+    pair_probs = incorrect_pairs / np.sum(incorrect_pairs)
+    pair_ravel_idx = np.where(np.random.multinomial(1, pair_probs.ravel()))
+    i, j = np.unravel_index(pair_ravel_idx[0][0], pair_probs.shape)
+
+    if gold_cluster_lbls[i] == gold_cluster_lbls[j]:
+        mlcl_constraint = (i, j, 1)
+        ecc_constraint = (point_feats[i] + point_feats[j])
+        ecc_constraint.data = np.clip(ecc_constraint.data, 0, 1)
+        ecc_constraints = [ecc_constraint]
+    else:
+        mlcl_constraint = (i, j, -1)
+        ecc_constraint1 = (point_feats[i] - point_feats[j]) + point_feats[i]
+        ecc_constraint1.data = np.clip(ecc_constraint1.data, -1, 1)
+        ecc_constraint2 = (point_feats[j] - point_feats[i]) + point_feats[j]
+        ecc_constraint2.data = np.clip(ecc_constraint2.data, -1, 1)
+        ecc_constraints = [ecc_constraint1, ecc_constraint2]
+
+    return mlcl_constraint, ecc_constraints
 
 
 def simulate(edge_weights: csr_matrix,
@@ -236,6 +276,11 @@ def simulate(edge_weights: csr_matrix,
              gold_clustering: np.ndarray,
              max_rounds: int,
              max_sdp_iters: int): 
+
+    gold_cluster_feats = sp_vstack([
+        get_cluster_feats(point_features[gold_clustering == i])
+            for i in np.unique(gold_clustering)
+    ])
 
     clusterer = MLCLClusterer(edge_weights=edge_weights,
                               max_sdp_iters=max_sdp_iters)
@@ -284,27 +329,15 @@ def simulate(edge_weights: csr_matrix,
             logging.info('Achieved perfect clustering at round %d.', r)
             break
 
-        embed()
-        exit()
-
         # generate a new constraint
-        while True:
-            mlcl_constraint, ecc_constraints = gen_mlcl_constraint(
-                    gold_clustering,
-                    pred_clustering,
-                    point_features,
-            )
-
-            # TODO: compute `already_exists`
-
-            if already_exists:
-                raise RuntimeError('Generated constraint that already exists.')
-
-            ecc_constraints_for_replay.append(ecc_constraints)
-            break
-
+        mlcl_constraint, ecc_constraints = gen_mlcl_constraint(
+                gold_clustering,
+                pred_clustering,
+                point_features,
+        )
+        ecc_constraints_for_replay.append(ecc_constraints)
         logging.info('Adding new constraint')
-        clusterer.add_constraint(ecc_constraint)
+        clusterer.add_constraint(mlcl_constraint)
 
     return (ecc_constraints_for_replay,
             clusterer.mlcl_constraints,
@@ -369,6 +402,7 @@ if __name__ == '__main__':
 
     ecc_for_replay = {}
     mlcl_for_replay = {}
+    pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
     for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']

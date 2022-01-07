@@ -691,8 +691,6 @@ if __name__ == '__main__':
         mlcl_for_replay[block_name] = block_mlcl_for_replay
         pred_clusterings[block_name] = round_pred_clusterings
 
-        break
-
     if not hparams.debug:
         logging.info('Dumping ecc and mlcl constraints for replay')
         ecc_fname = os.path.join(hparams.output_dir, 'ecc_for_replay.pkl')
