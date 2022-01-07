@@ -23,6 +23,7 @@ from scipy.sparse import csr_matrix, coo_matrix, dok_matrix
 from scipy.sparse import vstack as sp_vstack
 from scipy.special import softmax
 from sklearn.metrics import adjusted_rand_score as rand_idx
+from sklearn.metrics import homogeneity_completeness_v_measure as cluster_f1
 
 from trellis import Trellis
 
@@ -505,6 +506,7 @@ def simulate(edge_weights: csr_matrix,
     #neg_col_wt = feat_freq
 
     pairwise_constraints_for_replay = []
+    round_pred_clusterings = []
 
     for r in range(max_rounds):
         # compute predicted clustering
@@ -520,6 +522,9 @@ def simulate(edge_weights: csr_matrix,
         for i in range(pred_clustering.size):
             pred_clustering[i] = remap_lbl_dict[pred_clustering[i]]
 
+        # record `pred_clustering` for later analysis
+        round_pred_clusterings.append(copy.deepcopy(pred_clustering))
+
         # construct jaccard similarity matching matrix
         matching_mx = np.empty((gold_cluster_feats.shape[0],
                                 pred_cluster_feats.shape[0]))
@@ -532,6 +537,7 @@ def simulate(edge_weights: csr_matrix,
         # handle some metric stuffs
         metrics['match_feat_coeff'] = np.mean(np.max(matching_mx, axis=1))
         metrics['rand_idx'] = rand_idx(gold_clustering, pred_clustering)
+        metrics['f1'] = cluster_f1(gold_clustering, pred_clustering)[2]
         metric_str = '; '.join([
             k + ' = ' 
             + ('{:.4f}'.format(v) if isinstance(v, float) else str(v))
@@ -582,7 +588,9 @@ def simulate(edge_weights: csr_matrix,
         logging.info('Adding new constraint')
         clusterer.add_constraint(ecc_constraint)
 
-    return clusterer.ecc_constraints, pairwise_constraints_for_replay
+    return (clusterer.ecc_constraints,
+            pairwise_constraints_for_replay,
+            round_pred_clusterings)
 
 
 def get_hparams():
@@ -651,6 +659,7 @@ if __name__ == '__main__':
 
     ecc_for_replay = {}
     mlcl_for_replay = {}
+    pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
     for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
@@ -665,7 +674,9 @@ if __name__ == '__main__':
         logging.info(f'\t number of clusters: {num_clusters}')
         logging.info(f'\t number of features: {point_features.shape[1]}')
 
-        block_ecc_for_replay, block_mlcl_for_replay = simulate(
+        (block_ecc_for_replay,
+         block_mlcl_for_replay,
+         round_pred_clusterings) = simulate(
                 edge_weights,
                 point_features,
                 gold_clustering,
@@ -678,10 +689,15 @@ if __name__ == '__main__':
 
         ecc_for_replay[block_name] = block_ecc_for_replay
         mlcl_for_replay[block_name] = block_mlcl_for_replay
+        pred_clusterings[block_name] = round_pred_clusterings
+
+        break
 
     if not hparams.debug:
         logging.info('Dumping ecc and mlcl constraints for replay')
         ecc_fname = os.path.join(hparams.output_dir, 'ecc_for_replay.pkl')
         mlcl_fname = os.path.join(hparams.output_dir, 'mlcl_for_replay.pkl')
+        pred_fname = os.path.join(hparams.output_dir, 'pred_clusterings.pkl')
         pickle.dump(ecc_for_replay, open(ecc_fname, 'wb'))
         pickle.dump(mlcl_for_replay, open(mlcl_fname, 'wb'))
+        pickle.dump(pred_clusterings, open(pred_fname, 'wb'))
