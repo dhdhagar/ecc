@@ -130,11 +130,9 @@ def build_trellis_from_trees(trees: np.ndarray):
 
 class Trellis(object):
 
-    def __init__(self, adj_mx: np.ndarray, num_trees: int, noise_lvl: float):
+    def __init__(self, adj_mx: np.ndarray):
         self.adj_mx = adj_mx
         self.n = adj_mx.shape[0]
-        self.num_trees = num_trees
-        self.noise_lvl = noise_lvl
         self.topo_order = None
 
     def fit(self):
@@ -152,12 +150,12 @@ class Trellis(object):
             hg.binary_partition_tree_exponential_linkage(g, dists, 1.0)[0].parents()
         ]
 
-        for _ in range(self.num_trees-5):
-            noise = np.random.normal(
-                    loc=0.0, scale=self.noise_lvl, size=dists.shape)
-            noise_tree, _ = hg.binary_partition_tree_average_linkage(
-                    g, dists+noise)
-            trees.append(noise_tree.parents())
+        #for _ in range(<NUM_TREES_TO_GENERATE>):
+        #    noise = np.random.normal(
+        #            loc=0.0, scale=self.noise_lvl, size=dists.shape)
+        #    noise_tree, _ = hg.binary_partition_tree_average_linkage(
+        #            g, dists+noise)
+        #    trees.append(noise_tree.parents())
 
         trees = np.vstack(trees)
 
@@ -184,20 +182,3 @@ class Trellis(object):
                 self.child_pairs_indptr[node_idx+1], 2):
             yield (self.child_pairs_indices[i],
                    self.child_pairs_indices[i+1])
-
-
-if __name__ == '__main__':
-    logging.basicConfig(
-            format='(trellis) :: %(asctime)s >> %(message)s',
-            datefmt='%m-%d-%y %H:%M:%S',
-            level=logging.INFO
-    )
-
-    with open('test_sim_graph.pkl', 'rb') as f:
-        X = pickle.load(f)
-
-    trellis = Trellis(adj_mx=X, num_trees=5, noise_lvl=0.2)
-    trellis.fit()
-
-    embed()
-    exit()

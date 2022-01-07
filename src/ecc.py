@@ -4,8 +4,10 @@
 #       python ecc.py
 #
 
+import argparse
 import copy
 from itertools import product
+import json
 import logging
 import pickle
 import time
@@ -28,9 +30,14 @@ from IPython import embed
 
 class EccClusterer(object):
 
-    def __init__(self, edge_weights: csr_matrix, features: np.ndarray):
+    def __init__(self,
+                 edge_weights: csr_matrix,
+                 features: np.ndarray,
+                 max_sdp_iters: int):
+
         self.edge_weights = edge_weights.tocoo()
         self.features = features
+        self.max_sdp_iters = max_sdp_iters
         self.n = self.features.shape[0]
         self.ecc_constraints = []
         self.ecc_mx = None
@@ -160,7 +167,9 @@ class EccClusterer(object):
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
 
         logging.info('Solving optimization problem')
-        sdp_obj_value = prob.solve(solver=cp.SCS, verbose=True, max_iters=50000)
+        sdp_obj_value = prob.solve(
+                solver=cp.SCS, verbose=True, max_iters=self.max_sdp_iters
+        )
 
         pw_probs = X.value
         if self.incompat_mx is not None:
@@ -174,9 +183,7 @@ class EccClusterer(object):
         return sdp_obj_value, pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
-        num_trees = 5
-        noise_lvl = 0.05
-        t = Trellis(adj_mx=pw_probs, num_trees=num_trees, noise_lvl=noise_lvl)
+        t = Trellis(adj_mx=pw_probs)
         t.fit()
         return t
 
@@ -438,40 +445,44 @@ def gen_ecc_constraint(point_feats: csr_matrix,
     gold_cluster_points = set(np.where(gold_cluster_lbls==gold_cluster_idx)[0])
     pred_cluster_points = set(np.where(pred_cluster_lbls==pred_cluster_idx)[0])
 
-    gold_and_pred = gold_cluster_points & pred_cluster_points
     gold_not_pred = gold_cluster_points - pred_cluster_points
     pred_not_gold = pred_cluster_points - gold_cluster_points
 
     num_points = point_feats.shape[0]
     pairwise_constraints = dok_matrix((num_points, num_points))
-    for s, t in product(gold_and_pred, gold_not_pred):
+    for s, t in product(pred_cluster_points, gold_not_pred):
         s_feats = set(point_feats[s].indices)
         t_feats = set(point_feats[t].indices)
         if not (s_feats.isdisjoint(overlap_feats) 
-                or t_feats.isdisjoint(overlap_feats)
                 or t_feats.isdisjoint(pos_feats)):
-            if s < t:
-                pairwise_constraints[s, t] = 1
-            else:
-                pairwise_constraints[t, s] = 1
+            if gold_cluster_lbls[s] == gold_cluster_lbls[t]:
+                if s < t:
+                    pairwise_constraints[s, t] = 1
+                else:
+                    pairwise_constraints[t, s] = 1
 
-    for s, t in product(gold_and_pred, pred_not_gold):
+    for s, t in product(gold_cluster_points, pred_not_gold):
         s_feats = set(point_feats[s].indices)
         t_feats = set(point_feats[t].indices)
         if not (s_feats.isdisjoint(overlap_feats) 
-                or t_feats.isdisjoint(overlap_feats)
                 or t_feats.isdisjoint(neg_feats)):
-            if s < t:
-                pairwise_constraints[s, t] = -1
-            else:
-                pairwise_constraints[t, s] = -1
+            if gold_cluster_lbls[s] != gold_cluster_lbls[t]:
+                if s < t:
+                    pairwise_constraints[s, t] = -1
+                else:
+                    pairwise_constraints[t, s] = -1
 
-    return new_ecc, pairwise_constraints
+    return new_ecc, pairwise_constraints.tocoo()
 
 
 def simulate(edge_weights: csr_matrix,
              point_features: csr_matrix,
-             gold_clustering: np.ndarray):
+             gold_clustering: np.ndarray,
+             max_rounds: int,
+             max_sdp_iters: int,
+             max_overlap_feats: int,
+             max_pos_feats: int,
+             max_neg_feats: int):
 
     gold_cluster_feats = sp_vstack([
         get_cluster_feats(point_features[gold_clustering == i])
@@ -479,12 +490,8 @@ def simulate(edge_weights: csr_matrix,
     ])
 
     clusterer = EccClusterer(edge_weights=edge_weights,
-                             features=point_features)
-
-    # TODO: move these to hparams
-    max_overlap_feats = 100
-    max_pos_feats = 100
-    max_neg_feats = 100
+                             features=point_features,
+                             max_sdp_iters=max_sdp_iters)
 
     ## create column weights
     # for now just do some uniform feature sampling
@@ -496,7 +503,9 @@ def simulate(edge_weights: csr_matrix,
     #pos_col_wt = feat_freq
     #neg_col_wt = feat_freq
 
-    for r in range(100):
+    pairwise_constraints_for_replay = []
+
+    for r in range(max_rounds):
         # compute predicted clustering
         pred_clustering, metrics = clusterer.pred()
 
@@ -553,31 +562,77 @@ def simulate(edge_weights: csr_matrix,
             )
             already_exists = any([
                 (ecc_constraint != x).nnz == 0
-                for x in clusterer.ecc_constraints
+                    for x in clusterer.ecc_constraints
             ])
-            if not already_exists:
-                break
-            logging.warning('Produced duplicate ecc constraint')
+            if already_exists:
+                logging.warning('Produced duplicate ecc constraint')
+                continue
 
-        # add new constraint
+            already_satisfied = (
+                (pred_cluster_feats @ ecc_constraint.T) == ecc_constraint.nnz
+            ).todense().any()
+            if already_satisfied:
+                logging.warning('Produced already satisfied ecc constraint')
+                continue
+
+            pairwise_constraints_for_replay.append(pairwise_constraints)
+            break
+
+        logging.info('Adding new constraint')
         clusterer.add_constraint(ecc_constraint)
+
+    return clusterer.ecc_constraints, pairwise_constraints_for_replay
+
+
+def get_hparams():
+    parser = argparse.ArgumentParser() 
+    parser.add_argument('--seed', type=int, default=42,
+                        help="random seed for initialization")
+    parser.add_argument('--debug', action='store_true',
+                        help="Enables and disables certain opts for debugging")
+    parser.add_argument("--output_dir", default=None, type=str,
+                        help="The output directory for this run.")
+    parser.add_argument("--data_path", default=None, type=str, required=True,
+                        help="Path to preprocessed data.")
+
+    parser.add_argument('--max_rounds', type=int, default=100,
+                        help="number of rounds to generate feedback for")
+    parser.add_argument('--max_sdp_iters', type=int, default=50000,
+                        help="max num iterations for sdp solver")
+
+    # for constraint generation
+    parser.add_argument('--max_overlap_feats', type=int, default=2,
+                        help="max num overlap features to sample.")
+    parser.add_argument('--max_pos_feats', type=int, default=2,
+                        help="max num positive features to sample.")
+    parser.add_argument('--max_neg_feats', type=int, default=2,
+                        help="max num negative features to sample.")
+
+    hparams = parser.parse_args()
+    return hparams
 
 
 if __name__ == '__main__':
+
     logging.basicConfig(
             format='(ECC) :: %(asctime)s >> %(message)s',
             datefmt='%m-%d-%y %H:%M:%S',
             level=logging.INFO
     )
 
-    seed = 42
-    pl.utilities.seed.seed_everything(seed)
+    hparams = get_hparams()
 
-    data_fname = '../data/pubmed_processed.pkl'
-    with open(data_fname, 'rb') as f:
+    logging.info('Experiment args:\n{}'.format(
+        json.dumps(vars(hparams), sort_keys=True, indent=4)))
+
+    pl.utilities.seed.seed_everything(hparams.seed)
+
+    with open(hparams.data_path, 'rb') as f:
+        logging.info('Loading preprocessed data.')
         blocks_preprocessed = pickle.load(f)
 
-    for block_name, block_data in blocks_preprocessed.items():
+    num_blocks = len(blocks_preprocessed)
+    for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
         point_features = block_data['point_features']
         gold_clustering = block_data['labels']
@@ -585,11 +640,18 @@ if __name__ == '__main__':
         assert edge_weights.shape[0] == point_features.shape[0]
         num_clusters = np.unique(gold_clustering).size
 
-        logging.info(f'Loaded block \"{block_name}\"')
+        logging.info(f'Loaded block \"{block_name}\" ({i+1}/{num_blocks})')
         logging.info(f'\t number of points: {edge_weights.shape[0]}')
         logging.info(f'\t number of clusters: {num_clusters}')
         logging.info(f'\t number of features: {point_features.shape[1]}')
 
-        simulate(edge_weights, point_features, gold_clustering)
-
-
+        ecc_constraints_for_replay, pairwise_constraints_for_replay = simulate(
+                edge_weights,
+                point_features,
+                gold_clustering,
+                hparams.max_rounds,
+                hparams.max_sdp_iters,
+                hparams.max_overlap_feats,
+                hparams.max_pos_feats,
+                hparams.max_neg_feats
+        )
