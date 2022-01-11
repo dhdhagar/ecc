@@ -365,6 +365,178 @@ def set_matching_matrix(gold_indptr: np.ndarray,
     return matching_mx
 
 
+@nb.njit
+def argmaximin(matching_mx: np.ndarray):
+    best_maximin = 1.0
+    best_argmaximin = (0, 0)
+    for i in range(matching_mx.shape[0]):
+        row_argmax = 0
+        row_max = 0.0
+        for j in range(matching_mx.shape[1]):
+            if matching_mx[i, j] > row_max:
+                row_argmax = j
+                row_max = matching_mx[i, j]
+        if row_max > 0.0 and row_max < best_maximin:
+            best_maximin = row_max
+            best_argmaximin = (i, row_argmax)
+    return best_argmaximin
+
+
+@nb.njit
+def nb_isin_sorted(values: np.ndarray, query: int):
+    dom_min = 0             # inclusive
+    dom_max = values.size   # exclusive
+    while dom_max - dom_min > 0:
+        i = ((dom_max - dom_min) // 2) + dom_min
+        if values[i] > query:
+            dom_max = i
+        elif values[i] < query:
+            dom_min = i + 1
+        else:
+            return True
+    return False
+
+
+@nb.njit
+def get_salient_feats(point_feats_indptr: np.ndarray,
+                      point_feats_indices: np.ndarray,
+                      point_idxs: np.ndarray,
+                      salient_feat_counts: np.ndarray):
+    for i in range(point_feats_indptr.size-1):
+        in_focus_set = nb_isin_sorted(point_idxs, i)
+        for j in range(point_feats_indptr[i], point_feats_indptr[i+1]):
+            if salient_feat_counts[point_feats_indices[j]] == -1:
+                continue
+            if not in_focus_set:
+                salient_feat_counts[point_feats_indices[j]] = -1
+            else:
+                salient_feat_counts[point_feats_indices[j]] += 1
+
+
+def gen_forced_ecc_constraint(point_feats: csr_matrix,
+                              gold_cluster_lbls: np.ndarray,
+                              pred_cluster_lbls: np.ndarray,
+                              gold_cluster_feats: csr_matrix,
+                              pred_cluster_feats: csr_matrix,
+                              matching_mx: np.ndarray,
+                              max_overlap_feats: int):
+    # set perfect match rows and columns to zero so they will not be picked
+    perfect_match = (matching_mx == 1.0)
+    row_mask = np.any(perfect_match, axis=1)
+    column_mask = np.any(perfect_match, axis=0)
+    to_zero_mask = row_mask[:, None] | column_mask[None, :]
+    matching_mx[to_zero_mask] = 0.0
+
+    # greedily pick minimax match
+    gold_cluster_idx, pred_cluster_idx = argmaximin(matching_mx)
+    
+    # get points in gold and pred clusters, resp.
+    gold_cluster_points = set(np.where(gold_cluster_lbls==gold_cluster_idx)[0])
+    pred_cluster_points = set(np.where(pred_cluster_lbls==pred_cluster_idx)[0])
+
+    gold_and_pred = np.asarray(list(gold_cluster_points & pred_cluster_points))
+    gold_not_pred = np.asarray(list(gold_cluster_points - pred_cluster_points))
+    pred_not_gold = np.asarray(list(pred_cluster_points - gold_cluster_points))
+
+    # start the sampling process with overlap feats
+    gold_and_pred_sfc = np.zeros((point_feats.shape[1],))
+    get_salient_feats(
+            point_feats.indptr,
+            point_feats.indices,
+            np.sort(gold_and_pred),
+            gold_and_pred_sfc
+    )
+    sampled_overlap_feats = np.where(gold_and_pred_sfc == 1.0)[0][:max_overlap_feats]
+    # NOTE: why doesn't this line below work well with the SDP?
+    # i.e. why don't the most common features work best
+    #sampled_overlap_feats = np.argsort(gold_and_pred_sfc)[-max_overlap_feats:]
+
+    # now onto postive feats
+    sampled_pos_feats = []
+    gold_not_pred_lbls = np.asarray(
+            [pred_cluster_lbls[i] for i in gold_not_pred])
+    for pred_lbl in np.unique(np.asarray(gold_not_pred_lbls)):
+        pred_cluster_mask = (gold_not_pred_lbls == pred_lbl)
+        gold_not_pred_sfc = np.zeros((point_feats.shape[1],))
+        get_salient_feats(
+                point_feats.indptr,
+                point_feats.indices,
+                np.sort(gold_not_pred[pred_cluster_mask]),
+                gold_not_pred_sfc
+        )
+        sampled_pos_feats.append(np.argmax(gold_not_pred_sfc))
+    sampled_pos_feats = np.asarray(sampled_pos_feats)
+
+    # lastly, negative feats
+    sampled_neg_feats = []
+    pred_not_gold_lbls = np.asarray(
+            [pred_cluster_lbls[i] for i in pred_not_gold])
+    for pred_lbl in np.unique(np.asarray(pred_not_gold_lbls)):
+        pred_cluster_mask = (pred_not_gold_lbls == pred_lbl)
+        pred_not_gold_sfc = np.zeros((point_feats.shape[1],))
+        get_salient_feats(
+                point_feats.indptr,
+                point_feats.indices,
+                np.sort(pred_not_gold[pred_cluster_mask]),
+                pred_not_gold_sfc
+        )
+        sampled_neg_feats.append(np.argmax(pred_not_gold_sfc))
+    sampled_neg_feats = np.asarray(sampled_neg_feats)
+
+    # create the ecc constraint
+    new_ecc_col = np.hstack(
+            (sampled_overlap_feats,
+             sampled_pos_feats,
+             sampled_neg_feats)
+    )
+    new_ecc_row = np.zeros_like(new_ecc_col)
+    new_ecc_data = np.hstack(
+            (np.ones_like(sampled_overlap_feats),
+             np.ones_like(sampled_pos_feats),
+             -1*np.ones_like(sampled_neg_feats))
+    )
+
+    new_ecc = coo_matrix(
+            (new_ecc_data, (new_ecc_row, new_ecc_col)),
+            shape=(1,point_feats.shape[1]),
+            dtype=np.int64
+    ).tocsr()
+
+    # generate "equivalent" pairwise point constraints
+    overlap_feats = set(sampled_overlap_feats)
+    pos_feats = set(sampled_pos_feats)
+    neg_feats = set(sampled_neg_feats)
+
+    gold_not_pred = gold_cluster_points - pred_cluster_points
+    pred_not_gold = pred_cluster_points - gold_cluster_points
+
+    num_points = point_feats.shape[0]
+    pairwise_constraints = dok_matrix((num_points, num_points))
+    for s, t in product(pred_cluster_points, gold_not_pred):
+        s_feats = set(point_feats[s].indices)
+        t_feats = set(point_feats[t].indices)
+        if not (s_feats.isdisjoint(overlap_feats) 
+                or t_feats.isdisjoint(pos_feats)):
+            if gold_cluster_lbls[s] == gold_cluster_lbls[t]:
+                if s < t:
+                    pairwise_constraints[s, t] = 1
+                else:
+                    pairwise_constraints[t, s] = 1
+
+    for s, t in product(gold_cluster_points, pred_not_gold):
+        s_feats = set(point_feats[s].indices)
+        t_feats = set(point_feats[t].indices)
+        if not (s_feats.isdisjoint(overlap_feats) 
+                or t_feats.isdisjoint(neg_feats)):
+            if gold_cluster_lbls[s] != gold_cluster_lbls[t]:
+                if s < t:
+                    pairwise_constraints[s, t] = -1
+                else:
+                    pairwise_constraints[t, s] = -1
+
+    return new_ecc, pairwise_constraints.tocoo()
+
+
 def gen_ecc_constraint(point_feats: csr_matrix,
                        gold_cluster_lbls: np.ndarray,
                        pred_cluster_lbls: np.ndarray,
@@ -410,7 +582,7 @@ def gen_ecc_constraint(point_feats: csr_matrix,
         choices = mx.tocoo().col
         k = min(num_sample, choices.size)
         if k > num_sample:
-            p = col_wt[choices]**1
+            p = col_wt[choices]
             p /= np.sum(p)
         else:
             p = None
@@ -498,12 +670,12 @@ def simulate(edge_weights: csr_matrix,
     ## create column weights
     # for now just do some uniform feature sampling
     feat_freq = np.array(point_features.sum(axis=0))
-    overlap_col_wt = np.ones((point_features.shape[1],))
-    pos_col_wt = np.ones((point_features.shape[1],))
-    neg_col_wt = np.ones((point_features.shape[1],))
-    #overlap_col_wt = feat_freq
-    #pos_col_wt = feat_freq
-    #neg_col_wt = feat_freq
+    #overlap_col_wt = np.ones((point_features.shape[1],))
+    #pos_col_wt = np.ones((point_features.shape[1],))
+    #neg_col_wt = np.ones((point_features.shape[1],))
+    overlap_col_wt = feat_freq**10
+    pos_col_wt = feat_freq**10
+    neg_col_wt = feat_freq**10
 
     pairwise_constraints_for_replay = []
     round_pred_clusterings = []
@@ -553,26 +725,36 @@ def simulate(edge_weights: csr_matrix,
 
         # generate a new constraint
         while True:
-            ecc_constraint, pairwise_constraints = gen_ecc_constraint(
+            #ecc_constraint, pairwise_constraints = gen_ecc_constraint(
+            #        point_features,
+            #        gold_clustering,
+            #        pred_clustering,
+            #        gold_cluster_feats,
+            #        pred_cluster_feats,
+            #        matching_mx,
+            #        max_overlap_feats,
+            #        max_pos_feats,
+            #        max_neg_feats,
+            #        overlap_col_wt,
+            #        pos_col_wt,
+            #        neg_col_wt
+            #)
+            ecc_constraint, pairwise_constraints = gen_forced_ecc_constraint(
                     point_features,
                     gold_clustering,
                     pred_clustering,
                     gold_cluster_feats,
                     pred_cluster_feats,
                     matching_mx,
-                    max_overlap_feats,
-                    max_pos_feats,
-                    max_neg_feats,
-                    overlap_col_wt,
-                    pos_col_wt,
-                    neg_col_wt
+                    max_overlap_feats
             )
             already_exists = any([
                 (ecc_constraint != x).nnz == 0
                     for x in clusterer.ecc_constraints
             ])
             if already_exists:
-                logging.warning('Produced duplicate ecc constraint')
+                logging.error('Produced duplicate ecc constraint')
+                exit()
                 continue
 
             already_satisfied = (
@@ -661,7 +843,12 @@ if __name__ == '__main__':
     mlcl_for_replay = {}
     pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
-    for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
+
+    # For testing
+    sub_blocks_preprocessed = {}
+    sub_blocks_preprocessed['k chen'] = blocks_preprocessed['k chen']
+
+    for i, (block_name, block_data) in enumerate(sub_blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
         point_features = block_data['point_features']
         gold_clustering = block_data['labels']
@@ -690,6 +877,8 @@ if __name__ == '__main__':
         ecc_for_replay[block_name] = block_ecc_for_replay
         mlcl_for_replay[block_name] = block_mlcl_for_replay
         pred_clusterings[block_name] = round_pred_clusterings
+
+        break
 
     if not hparams.debug:
         logging.info('Dumping ecc and mlcl constraints for replay')
