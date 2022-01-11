@@ -844,11 +844,7 @@ if __name__ == '__main__':
     pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
 
-    # For testing
-    sub_blocks_preprocessed = {}
-    sub_blocks_preprocessed['k chen'] = blocks_preprocessed['k chen']
-
-    for i, (block_name, block_data) in enumerate(sub_blocks_preprocessed.items()):
+    for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
         point_features = block_data['point_features']
         gold_clustering = block_data['labels']
@@ -877,8 +873,6 @@ if __name__ == '__main__':
         ecc_for_replay[block_name] = block_ecc_for_replay
         mlcl_for_replay[block_name] = block_mlcl_for_replay
         pred_clusterings[block_name] = round_pred_clusterings
-
-        break
 
     if not hparams.debug:
         logging.info('Dumping ecc and mlcl constraints for replay')
