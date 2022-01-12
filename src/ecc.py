@@ -255,6 +255,8 @@ class EccClusterer(object):
         obj_vals = np.zeros((t.num_nodes,))
         num_ecc_sat = np.zeros((t.num_nodes,))
 
+        node_start = -1
+        node_end = -1
         for node in t.internal_nodes_topo_ordered():
             node_start = membership_indptr[node]
             node_end = membership_indptr[node+1]
