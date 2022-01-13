@@ -272,19 +272,42 @@ def gen_mlcl_constraint(gold_cluster_lbls: np.ndarray,
 
 
 @nb.njit
-def argmaximin(matching_mx: np.ndarray):
+def get_point_matching_mx(gold_cluster_lbls: np.ndarray,
+                          pred_cluster_lbls: np.ndarray):
+    num_gold_clusters = np.unique(gold_cluster_lbls).size
+    num_pred_clusters = np.unique(pred_cluster_lbls).size
+    intersect_mx = np.zeros((num_gold_clusters, num_pred_clusters))
+    union_mx = np.zeros((num_gold_clusters, num_pred_clusters))
+    for i in range(gold_cluster_lbls.size):
+        gold_idx = gold_cluster_lbls[i]
+        pred_idx = pred_cluster_lbls[i]
+        intersect_mx[gold_idx, pred_idx] += 1
+        union_mx[gold_idx, :] += 1
+        union_mx[:, pred_idx] += 1
+        union_mx[gold_idx, pred_idx] -= 1
+    return intersect_mx / union_mx
+
+
+@nb.njit
+def argmaximin(row_max: np.ndarray,
+               col_max: np.ndarray,
+               row_argmax: np.ndarray,
+               col_argmax: np.ndarray,
+               row_indices: np.ndarray,
+               col_indices: np.ndarray):
+    # This function picks the pair of gold and pred clusters which has 
+    # the highest potential gain in cluster F1.
     best_maximin = 1.0
     best_argmaximin = (0, 0)
-    for i in range(matching_mx.shape[0]):
-        row_argmax = 0
-        row_max = 0.0
-        for j in range(matching_mx.shape[1]):
-            if matching_mx[i, j] > row_max:
-                row_argmax = j
-                row_max = matching_mx[i, j]
-        if row_max > 0.0 and row_max < best_maximin:
-            best_maximin = row_max
-            best_argmaximin = (i, row_argmax)
+    for i in range(row_indices.size):
+        curr_maximin = max(row_max[row_indices[i]], col_max[col_indices[i]])
+        if row_max[row_indices[i]] < col_max[col_indices[i]]:
+            curr_argmaximin = (col_argmax[col_indices[i]], col_indices[i])
+        else:
+            curr_argmaximin = (row_indices[i], row_argmax[row_indices[i]])
+        if curr_maximin < best_maximin:
+            best_maximin = curr_maximin
+            best_argmaximin = curr_argmaximin
     return best_argmaximin
 
 
@@ -295,15 +318,28 @@ def gen_forced_mlcl_constraints(point_feats: csr_matrix,
 
     mlcl_constraints = []
 
+    # construct the point matching matrix
+    point_matching_mx = get_point_matching_mx(
+            gold_cluster_lbls, pred_cluster_lbls)
+
     # set perfect match rows and columns to zero so they will not be picked
-    perfect_match = (matching_mx == 1.0)
+    perfect_match = (point_matching_mx == 1.0)
     row_mask = np.any(perfect_match, axis=1)
     column_mask = np.any(perfect_match, axis=0)
     to_zero_mask = row_mask[:, None] | column_mask[None, :]
-    matching_mx[to_zero_mask] = 0.0
+    point_matching_mx[to_zero_mask] = 0.0
 
     # greedily pick minimax match
-    gold_cluster_idx, pred_cluster_idx = argmaximin(matching_mx)
+    row_max = np.max(point_matching_mx, axis=1)
+    col_max = np.max(point_matching_mx, axis=0)
+    row_argmax = np.argmax(point_matching_mx, axis=1)
+    col_argmax = np.argmax(point_matching_mx, axis=0)
+    row_indices, col_indices = np.where(point_matching_mx > 0.0)
+    gold_cluster_idx, pred_cluster_idx = argmaximin(
+            row_max, col_max, row_argmax, col_argmax, row_indices, col_indices)
+
+    logging.info(f'Gold Cluster: {gold_cluster_idx},'
+                 f' Pred Cluster: {pred_cluster_idx}')
     
     # get points in gold and pred clusters, resp.
     gold_cluster_points = set(np.where(gold_cluster_lbls==gold_cluster_idx)[0])
@@ -334,9 +370,9 @@ def gen_forced_mlcl_constraints(point_feats: csr_matrix,
     # lastly, negative feats
     sampled_neg_feats = []
     pred_not_gold_lbls = np.asarray(
-            [pred_cluster_lbls[i] for i in pred_not_gold])
-    for pred_lbl in np.unique(np.asarray(pred_not_gold_lbls)):
-        pred_cluster_mask = (pred_not_gold_lbls == pred_lbl)
+            [gold_cluster_lbls[i] for i in pred_not_gold])
+    for gold_lbl in np.unique(np.asarray(pred_not_gold_lbls)):
+        pred_cluster_mask = (pred_not_gold_lbls == gold_lbl)
         edge = (gold_and_pred[0], pred_not_gold[pred_cluster_mask][0])
         if edge[0] < edge[1]:
             mlcl_constraints.append((edge[0], edge[1], -1))
@@ -431,12 +467,15 @@ def simulate(edge_weights: csr_matrix,
                 pred_clustering,
                 matching_mx
         )
-        logging.info('Adding new constraint')
         if gen_constraints_in_batches:
+            logging.info('Adding new constraints')
             for mlcl_constraint in mlcl_constraints:
                 clusterer.add_constraint(mlcl_constraint)
+                logging.info(f'n{mlcl_constraint[0]} {"-" if mlcl_constraint[2] < 0 else "+"} n{mlcl_constraint[1]}')
         else:
+            logging.info('Adding new constraint')
             clusterer.add_constraint(mlcl_constraints[0])
+            logging.info(f'n{mlcl_constraints[0][0]} {"-" if mlcl_constraints[0][2] < 0 else "+"} n{mlcl_constraints[0][1]}')
 
     return clusterer.mlcl_constraints, round_pred_clusterings
 
@@ -503,6 +542,7 @@ if __name__ == '__main__':
     mlcl_for_replay = {}
     pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
+
     for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
         point_features = block_data['point_features']
