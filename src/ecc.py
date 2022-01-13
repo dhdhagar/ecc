@@ -502,6 +502,20 @@ def gen_forced_ecc_constraint(point_feats: csr_matrix,
             dtype=np.int64
     ).tocsr()
 
+    # for debugging
+    constraint_str = ', '.join(
+            [('+f' if d > 0 else '-f') + str(int(c))
+                for c, d in zip(new_ecc_col, new_ecc_data)]
+    )
+    logging.info(f'Constraint generated: [{constraint_str}]')
+
+    logging.info('Nodes with features: {')
+    for feat_id in new_ecc_col:
+        nodes_with_feat = point_feats.T[feat_id].tocoo().col
+        nodes_with_feat = [f'n{i}' for i in nodes_with_feat]
+        logging.info(f'\tf{int(feat_id)}: {", ".join(nodes_with_feat)}')
+    logging.info('}')
+
     # generate "equivalent" pairwise point constraints
     overlap_feats = set(sampled_overlap_feats)
     pos_feats = set(sampled_pos_feats)
@@ -667,16 +681,6 @@ def simulate(edge_weights: csr_matrix,
                              features=point_features,
                              max_sdp_iters=max_sdp_iters)
 
-    ## create column weights
-    # for now just do some uniform feature sampling
-    feat_freq = np.array(point_features.sum(axis=0))
-    #overlap_col_wt = np.ones((point_features.shape[1],))
-    #pos_col_wt = np.ones((point_features.shape[1],))
-    #neg_col_wt = np.ones((point_features.shape[1],))
-    overlap_col_wt = feat_freq**10
-    pos_col_wt = feat_freq**10
-    neg_col_wt = feat_freq**10
-
     pairwise_constraints_for_replay = []
     round_pred_clusterings = []
 
@@ -693,6 +697,21 @@ def simulate(edge_weights: csr_matrix,
         remap_lbl_dict = {j: i for i, j in enumerate(uniq_pred_cluster_lbls)}
         for i in range(pred_clustering.size):
             pred_clustering[i] = remap_lbl_dict[pred_clustering[i]]
+
+        # for debugging
+        logging.info('Gold Clustering: {')
+        for cluster_id in np.unique(gold_clustering):
+            nodes_in_cluster = list(np.where(gold_clustering == cluster_id)[0])
+            nodes_in_cluster = [f'n{i}' for i in nodes_in_cluster]
+            logging.info(f'\tc{cluster_id}: {", ".join(nodes_in_cluster)}')
+        logging.info('}')
+
+        logging.info('Predicted Clustering: {')
+        for cluster_id in np.unique(pred_clustering):
+            nodes_in_cluster = list(np.where(pred_clustering == cluster_id)[0])
+            nodes_in_cluster = [f'n{i}' for i in nodes_in_cluster]
+            logging.info(f'\tc{cluster_id}: {", ".join(nodes_in_cluster)}')
+        logging.info('}')
 
         # record `pred_clustering` for later analysis
         round_pred_clusterings.append(copy.deepcopy(pred_clustering))
@@ -725,20 +744,6 @@ def simulate(edge_weights: csr_matrix,
 
         # generate a new constraint
         while True:
-            #ecc_constraint, pairwise_constraints = gen_ecc_constraint(
-            #        point_features,
-            #        gold_clustering,
-            #        pred_clustering,
-            #        gold_cluster_feats,
-            #        pred_cluster_feats,
-            #        matching_mx,
-            #        max_overlap_feats,
-            #        max_pos_feats,
-            #        max_neg_feats,
-            #        overlap_col_wt,
-            #        pos_col_wt,
-            #        neg_col_wt
-            #)
             ecc_constraint, pairwise_constraints = gen_forced_ecc_constraint(
                     point_features,
                     gold_clustering,

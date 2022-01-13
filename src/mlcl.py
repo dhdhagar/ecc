@@ -271,11 +271,91 @@ def gen_mlcl_constraint(gold_cluster_lbls: np.ndarray,
     return mlcl_constraint, ecc_constraints
 
 
+@nb.njit
+def argmaximin(matching_mx: np.ndarray):
+    best_maximin = 1.0
+    best_argmaximin = (0, 0)
+    for i in range(matching_mx.shape[0]):
+        row_argmax = 0
+        row_max = 0.0
+        for j in range(matching_mx.shape[1]):
+            if matching_mx[i, j] > row_max:
+                row_argmax = j
+                row_max = matching_mx[i, j]
+        if row_max > 0.0 and row_max < best_maximin:
+            best_maximin = row_max
+            best_argmaximin = (i, row_argmax)
+    return best_argmaximin
+
+
+def gen_forced_mlcl_constraints(point_feats: csr_matrix,
+                                gold_cluster_lbls: np.ndarray,
+                                pred_cluster_lbls: np.ndarray,
+                                matching_mx: np.ndarray):
+
+    mlcl_constraints = []
+
+    # set perfect match rows and columns to zero so they will not be picked
+    perfect_match = (matching_mx == 1.0)
+    row_mask = np.any(perfect_match, axis=1)
+    column_mask = np.any(perfect_match, axis=0)
+    to_zero_mask = row_mask[:, None] | column_mask[None, :]
+    matching_mx[to_zero_mask] = 0.0
+
+    # greedily pick minimax match
+    gold_cluster_idx, pred_cluster_idx = argmaximin(matching_mx)
+    
+    # get points in gold and pred clusters, resp.
+    gold_cluster_points = set(np.where(gold_cluster_lbls==gold_cluster_idx)[0])
+    pred_cluster_points = set(np.where(pred_cluster_lbls==pred_cluster_idx)[0])
+
+    gold_and_pred = np.asarray(list(gold_cluster_points & pred_cluster_points))
+    gold_not_pred = np.asarray(list(gold_cluster_points - pred_cluster_points))
+    pred_not_gold = np.asarray(list(pred_cluster_points - gold_cluster_points))
+
+    largest_potential = 0
+
+    # now onto postive feats
+    sampled_pos_feats = []
+    gold_not_pred_lbls = np.asarray(
+            [pred_cluster_lbls[i] for i in gold_not_pred])
+    for pred_lbl in np.unique(np.asarray(gold_not_pred_lbls)):
+        pred_cluster_mask = (gold_not_pred_lbls == pred_lbl)
+        edge = (gold_and_pred[0], gold_not_pred[pred_cluster_mask][0])
+        if edge[0] < edge[1]:
+            mlcl_constraints.append((edge[0], edge[1], 1))
+        else:
+            mlcl_constraints.append((edge[1], edge[0], 1))
+
+        if np.sum(pred_cluster_mask) > largest_potential:
+            largest_potential = np.sum(pred_cluster_mask)
+            mlcl_constraints[0], mlcl_constraints[-1] = mlcl_constraints[-1], mlcl_constraints[0]
+
+    # lastly, negative feats
+    sampled_neg_feats = []
+    pred_not_gold_lbls = np.asarray(
+            [pred_cluster_lbls[i] for i in pred_not_gold])
+    for pred_lbl in np.unique(np.asarray(pred_not_gold_lbls)):
+        pred_cluster_mask = (pred_not_gold_lbls == pred_lbl)
+        edge = (gold_and_pred[0], pred_not_gold[pred_cluster_mask][0])
+        if edge[0] < edge[1]:
+            mlcl_constraints.append((edge[0], edge[1], -1))
+        else:
+            mlcl_constraints.append((edge[1], edge[0], -1))
+
+        if np.sum(pred_cluster_mask) > largest_potential:
+            largest_potential = np.sum(pred_cluster_mask)
+            mlcl_constraints[0], mlcl_constraints[-1] = mlcl_constraints[-1], mlcl_constraints[0]
+
+    return mlcl_constraints
+
+
 def simulate(edge_weights: csr_matrix,
              point_features: csr_matrix,
              gold_clustering: np.ndarray,
              max_rounds: int,
-             max_sdp_iters: int): 
+             max_sdp_iters: int,
+             gen_constraints_in_batches: bool): 
 
     gold_cluster_feats = sp_vstack([
         get_cluster_feats(point_features[gold_clustering == i])
@@ -285,7 +365,6 @@ def simulate(edge_weights: csr_matrix,
     clusterer = MLCLClusterer(edge_weights=edge_weights,
                               max_sdp_iters=max_sdp_iters)
 
-    ecc_constraints_for_replay = []
     round_pred_clusterings = []
 
     for r in range(max_rounds):
@@ -301,6 +380,22 @@ def simulate(edge_weights: csr_matrix,
         remap_lbl_dict = {j: i for i, j in enumerate(uniq_pred_cluster_lbls)}
         for i in range(pred_clustering.size):
             pred_clustering[i] = remap_lbl_dict[pred_clustering[i]]
+
+        # for debugging
+        logging.info('Gold Clustering: {')
+        for cluster_id in np.unique(gold_clustering):
+            nodes_in_cluster = list(np.where(gold_clustering == cluster_id)[0])
+            nodes_in_cluster = [f'n{i}' for i in nodes_in_cluster]
+            logging.info(f'\tc{cluster_id}: {", ".join(nodes_in_cluster)}')
+        logging.info('}')
+
+        logging.info('Predicted Clustering: {')
+        for cluster_id in np.unique(pred_clustering):
+            nodes_in_cluster = list(np.where(pred_clustering == cluster_id)[0])
+            nodes_in_cluster = [f'n{i}' for i in nodes_in_cluster]
+            logging.info(f'\tc{cluster_id}: {", ".join(nodes_in_cluster)}')
+        logging.info('}')
+
         round_pred_clusterings.append(copy.deepcopy(pred_clustering))
 
         # construct jaccard similarity matching matrix
@@ -330,18 +425,20 @@ def simulate(edge_weights: csr_matrix,
             break
 
         # generate a new constraint
-        mlcl_constraint, ecc_constraints = gen_mlcl_constraint(
+        mlcl_constraints = gen_forced_mlcl_constraints(
+                point_features,
                 gold_clustering,
                 pred_clustering,
-                point_features,
+                matching_mx
         )
-        ecc_constraints_for_replay.append(ecc_constraints)
         logging.info('Adding new constraint')
-        clusterer.add_constraint(mlcl_constraint)
+        if gen_constraints_in_batches:
+            for mlcl_constraint in mlcl_constraints:
+                clusterer.add_constraint(mlcl_constraint)
+        else:
+            clusterer.add_constraint(mlcl_constraints[0])
 
-    return (ecc_constraints_for_replay,
-            clusterer.mlcl_constraints,
-            round_pred_clusterings)
+    return clusterer.mlcl_constraints, round_pred_clusterings
 
 
 def get_hparams():
@@ -350,6 +447,9 @@ def get_hparams():
                         help="random seed for initialization")
     parser.add_argument('--debug', action='store_true',
                         help="Enables and disables certain opts for debugging")
+    parser.add_argument('--gen_constraints_in_batches', action='store_true',
+                        help="Whether or not to generate more than one"
+                             " constraint at a time.")
     parser.add_argument("--output_dir", default=None, type=str,
                         help="The output directory for this run.")
     parser.add_argument("--data_path", default=None, type=str, required=True,
@@ -400,7 +500,6 @@ if __name__ == '__main__':
         logging.info('Loading preprocessed data.')
         blocks_preprocessed = pickle.load(f)
 
-    ecc_for_replay = {}
     mlcl_for_replay = {}
     pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
@@ -417,25 +516,21 @@ if __name__ == '__main__':
         logging.info(f'\t number of clusters: {num_clusters}')
         logging.info(f'\t number of features: {point_features.shape[1]}')
 
-        (block_ecc_for_replay,
-         block_mlcl_for_replay,
-         round_pred_clusterings) = simulate(
+        block_mlcl_for_replay, round_pred_clusterings = simulate(
                 edge_weights,
                 point_features,
                 gold_clustering,
                 hparams.max_rounds,
                 hparams.max_sdp_iters,
+                hparams.gen_constraints_in_batches
         )
 
-        ecc_for_replay[block_name] = block_ecc_for_replay
         mlcl_for_replay[block_name] = block_mlcl_for_replay
         pred_clusterings[block_name] = round_pred_clusterings
 
     if not hparams.debug:
         logging.info('Dumping ecc and mlcl constraints for replay')
-        ecc_fname = os.path.join(hparams.output_dir, 'ecc_for_replay.pkl')
         mlcl_fname = os.path.join(hparams.output_dir, 'mlcl_for_replay.pkl')
         pred_fname = os.path.join(hparams.output_dir, 'pred_clusterings.pkl')
-        pickle.dump(ecc_for_replay, open(ecc_fname, 'wb'))
         pickle.dump(mlcl_for_replay, open(mlcl_fname, 'wb'))
         pickle.dump(pred_clusterings, open(pred_fname, 'wb'))
