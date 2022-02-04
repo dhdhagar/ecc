@@ -5,6 +5,7 @@
 #
 
 import argparse
+from collections import defaultdict
 import copy
 from itertools import product
 import json
@@ -143,9 +144,9 @@ class EccClusterer(object):
                      pos_ecc_mx.indptr,
                      pos_ecc_mx.indices,
                      self.incompat_mx)
-            ecc_indices = [x + num_points for x in ecc_indices]
-            points_indptr = list(points_indptr)
-            points_indices = list(points_indices)
+            self.pos_feats_ecc_indices = [x + num_points for x in ecc_indices]
+            self.pos_feats_points_indptr = list(points_indptr)
+            self.pos_feats_points_indices = list(points_indices)
 
         # formulate SDP
         logging.info('Constructing optimization problem')
@@ -162,8 +163,11 @@ class EccClusterer(object):
             # "negative" ecc constraints
             constraints.extend([X[i,j] <= 0 for i, j in ortho_indices])
             # "positive" ecc constraints
-            for idx, i in enumerate(ecc_indices):
-                j_s = points_indices[points_indptr[idx]: points_indptr[idx+1]]
+            for idx, i in enumerate(self.pos_feats_ecc_indices):
+                j_s = self.pos_feats_points_indices[
+                        self.pos_feats_points_indptr[idx]:
+                        self.pos_feats_points_indptr[idx+1]
+                ]
                 constraints.append(sum([X[i,j] for j in j_s]) >= 1)
 
         prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
@@ -185,7 +189,26 @@ class EccClusterer(object):
         return sdp_obj_value, pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
-        t = Trellis(adj_mx=pw_probs)
+        forced_merge_dict = defaultdict(list)
+        if len(self.ecc_constraints) > 0:
+            force_beam_size = 2
+            for idx, i in enumerate(self.pos_feats_ecc_indices):
+                j_s = self.pos_feats_points_indices[
+                        self.pos_feats_points_indptr[idx]:
+                        self.pos_feats_points_indptr[idx+1]
+                ]
+                select_probs = [pw_probs[j, i] for j in j_s]
+                forced_merge_dict[i].extend(
+                        list(
+                            tuple(
+                                zip(*sorted(zip(j_s, select_probs),
+                                    key=lambda x: -x[1]))
+                            )[0][:force_beam_size]
+                        )
+                )
+        forced_merge_dict = dict(forced_merge_dict)
+
+        t = Trellis(adj_mx=pw_probs, forced_merge_dict=forced_merge_dict)
         t.fit()
         return t
 

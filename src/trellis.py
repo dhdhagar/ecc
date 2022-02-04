@@ -130,7 +130,7 @@ def build_trellis_from_trees(trees: np.ndarray):
 
 class Trellis(object):
 
-    def __init__(self, adj_mx: np.ndarray):
+    def __init__(self, adj_mx: np.ndarray, forced_merge_dict: dict):
         self.adj_mx = adj_mx
         self.n = adj_mx.shape[0]
         self.topo_order = None

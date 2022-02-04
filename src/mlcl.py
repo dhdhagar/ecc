@@ -363,9 +363,9 @@ def gen_forced_mlcl_constraints(point_feats: csr_matrix,
         else:
             mlcl_constraints.append((edge[1], edge[0], 1))
 
-        if np.sum(pred_cluster_mask) > largest_potential:
-            largest_potential = np.sum(pred_cluster_mask)
-            mlcl_constraints[0], mlcl_constraints[-1] = mlcl_constraints[-1], mlcl_constraints[0]
+        #if np.sum(pred_cluster_mask) > largest_potential:
+        #    largest_potential = np.sum(pred_cluster_mask)
+        #    mlcl_constraints[0], mlcl_constraints[-1] = mlcl_constraints[-1], mlcl_constraints[0]
 
     # lastly, negative feats
     sampled_neg_feats = []
@@ -379,9 +379,9 @@ def gen_forced_mlcl_constraints(point_feats: csr_matrix,
         else:
             mlcl_constraints.append((edge[1], edge[0], -1))
 
-        if np.sum(pred_cluster_mask) > largest_potential:
-            largest_potential = np.sum(pred_cluster_mask)
-            mlcl_constraints[0], mlcl_constraints[-1] = mlcl_constraints[-1], mlcl_constraints[0]
+        #if np.sum(pred_cluster_mask) > largest_potential:
+        #    largest_potential = np.sum(pred_cluster_mask)
+        #    mlcl_constraints[0], mlcl_constraints[-1] = mlcl_constraints[-1], mlcl_constraints[0]
 
     return mlcl_constraints
 
@@ -494,7 +494,7 @@ def get_hparams():
     parser.add_argument("--data_path", default=None, type=str, required=True,
                         help="Path to preprocessed data.")
 
-    parser.add_argument('--max_rounds', type=int, default=100,
+    parser.add_argument('--max_rounds', type=int, default=1000000,
                         help="number of rounds to generate feedback for")
     parser.add_argument('--max_sdp_iters', type=int, default=50000,
                         help="max num iterations for sdp solver")
