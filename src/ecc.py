@@ -148,6 +148,25 @@ class EccClusterer(object):
             self.pos_feats_points_indptr = list(points_indptr)
             self.pos_feats_points_indices = list(points_indices)
 
+            # TODO: add additional constraint incompatibility things
+            for idx, i in enumerate(self.pos_feats_ecc_indices):
+                pos_feats_points = self.pos_feats_points_indices[
+                        self.pos_feats_points_indptr[idx]:
+                        self.pos_feats_points_indptr[idx+1]
+                ]
+                for j in range(i+1, num_points + num_ecc):
+                    all_pos_incompat = True
+                    for l in pos_feats_points:
+                        if not self.incompat_mx[l, j-num_points]:
+                            all_pos_incompat = False
+                            break
+                    if all_pos_incompat:
+                        ortho_indices.append((i, j))
+                        ortho_indices.append((j, i))
+                        self.incompat_mx[i, j-num_points] = True
+                        self.incompat_mx[j, i-num_points] = True
+
+
         # formulate SDP
         logging.info('Constructing optimization problem')
         W = csr_matrix((self.edge_weights.data,
@@ -178,6 +197,7 @@ class EccClusterer(object):
         )
 
         pw_probs = X.value
+
         if self.incompat_mx is not None:
             # discourage incompatible nodes from clustering together
             self.incompat_mx = np.concatenate(
@@ -207,6 +227,7 @@ class EccClusterer(object):
                         )
                 )
         forced_merge_dict = dict(forced_merge_dict)
+        logging.info(f'forced_merge_dict: {forced_merge_dict}')
 
         t = Trellis(adj_mx=pw_probs, forced_merge_dict=forced_merge_dict)
         t.fit()
@@ -903,7 +924,10 @@ if __name__ == '__main__':
     pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
 
-    for i, (block_name, block_data) in enumerate(blocks_preprocessed.items()):
+    sub_blocks_preprocessed = {}
+    sub_blocks_preprocessed['l wang'] = blocks_preprocessed['l wang']
+
+    for i, (block_name, block_data) in enumerate(sub_blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
         point_features = block_data['point_features']
         gold_clustering = block_data['labels']

@@ -133,6 +133,7 @@ class Trellis(object):
     def __init__(self, adj_mx: np.ndarray, forced_merge_dict: dict):
         self.adj_mx = adj_mx
         self.n = adj_mx.shape[0]
+        self.forced_merge_dict = forced_merge_dict
         self.topo_order = None
 
     def fit(self):
@@ -143,19 +144,40 @@ class Trellis(object):
 
         trees = [hac_tree.parents()]
 
-        trees += [
-            hg.binary_partition_tree_single_linkage(g, dists)[0].parents(),
-            hg.binary_partition_tree_complete_linkage(g, dists)[0].parents(),
-            hg.binary_partition_tree_exponential_linkage(g, dists, -1.0)[0].parents(),
-            hg.binary_partition_tree_exponential_linkage(g, dists, 1.0)[0].parents()
-        ]
+        ptr = 0
+        tmp_dists = copy.deepcopy(dists)
+        while True:
+            forced_ecc_indices = []
+            forced_point_indices = []
+            for ecc_index, point_indices in self.forced_merge_dict.items():
+                if ptr >= len(point_indices):
+                    continue
+                elif point_indices[ptr] in forced_point_indices:
+                    point_indices.append(point_indices[ptr])
+                else:
+                    forced_ecc_indices.append(ecc_index)
+                    forced_point_indices.append(point_indices[ptr])
 
-        #for _ in range(<NUM_TREES_TO_GENERATE>):
-        #    noise = np.random.normal(
-        #            loc=0.0, scale=self.noise_lvl, size=dists.shape)
-        #    noise_tree, _ = hg.binary_partition_tree_average_linkage(
-        #            g, dists+noise)
-        #    trees.append(noise_tree.parents())
+            if len(forced_ecc_indices) == 0:
+                break
+            
+            for r, c in zip(forced_point_indices, forced_ecc_indices):
+                flat_index = (self.n * r) + c - ((r + 1) * (r + 2) // 2)
+                tmp_dists[flat_index] = 0.0
+
+            trees += [
+                hg.binary_partition_tree_average_linkage(g, tmp_dists)[0].parents(),
+                hg.binary_partition_tree_single_linkage(g, tmp_dists)[0].parents(),
+                hg.binary_partition_tree_complete_linkage(g, tmp_dists)[0].parents(),
+                hg.binary_partition_tree_exponential_linkage(g, tmp_dists, -1.0)[0].parents(),
+                hg.binary_partition_tree_exponential_linkage(g, tmp_dists, 1.0)[0].parents()
+            ]
+
+            for r, c in zip(forced_point_indices, forced_ecc_indices):
+                flat_index = (self.n * r) + c - ((r + 1) * (r + 2) // 2)
+                tmp_dists[flat_index] = dists[flat_index]
+
+            ptr += 1
 
         trees = np.vstack(trees)
 
