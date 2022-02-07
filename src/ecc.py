@@ -36,15 +36,72 @@ class EccClusterer(object):
     def __init__(self,
                  edge_weights: csr_matrix,
                  features: np.ndarray,
+                 max_num_ecc: int,
+                 max_pos_feats: int,
                  max_sdp_iters: int):
 
         self.edge_weights = edge_weights.tocoo()
         self.features = features
+        self.max_num_ecc = max_num_ecc
+        self.max_pos_feats = max_pos_feats
         self.max_sdp_iters = max_sdp_iters
-        self.n = self.features.shape[0]
+        self.num_points = self.features.shape[0]
+        self.num_ecc = 0
         self.ecc_constraints = []
+
         self.ecc_mx = None
         self.incompat_mx = None
+
+        n = self.num_points + self.max_num_ecc
+
+        # formulate SDP
+        logging.info('Constructing optimization problem')
+        W = csr_matrix((self.edge_weights.data,
+                        (self.edge_weights.row, self.edge_weights.col)),
+                        shape=(n, n))
+        self.X = cp.Variable((n, n), PSD=True)
+
+        # instatiate parameters
+        self.L = cp.Parameter((self.max_num_ecc, n))
+        self.U = cp.Parameter((self.max_num_ecc, n))
+        self.As = [cp.Parameter((n, self.max_num_ecc))
+                for _ in range(self.max_pos_feats)]
+        self.bs = [cp.Parameter((self.max_num_ecc,))
+                for _ in range(self.max_pos_feats)]
+
+        # initialize parameters
+        self.L.value = np.zeros((self.max_num_ecc, n))
+        self.U.value = np.ones((self.max_num_ecc, n))
+        for A in self.As:
+            A.value = np.zeros((n, self.max_num_ecc))
+        for b in self.bs:
+            b.value = np.zeros((self.max_num_ecc,))
+
+        # build out constraint set
+        constraints = [
+                cp.diag(self.X) == np.ones((n,)),
+                self.X[:self.num_points, :] >= 0,
+                self.X[self.num_points:, :] >= self.L,
+                self.X[self.num_points:, :] <= self.U,
+        ]
+        constraints.extend([
+            cp.trace(self.X[self.num_points:, :] @ A) >= b
+                for A, b in zip(self.As, self.bs)
+        ])
+
+        # create problem
+        self.prob = cp.Problem(cp.Maximize(cp.trace(W @ self.X)), constraints)
+
+        sdp_obj_value = self.prob.solve(
+                solver=cp.SCS,
+                verbose=True,
+                warm_start=True,
+                max_iters=self.max_sdp_iters,
+        )
+
+        embed()
+        exit()
+
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -148,7 +205,7 @@ class EccClusterer(object):
             self.pos_feats_points_indptr = list(points_indptr)
             self.pos_feats_points_indices = list(points_indices)
 
-            # TODO: add additional constraint incompatibility things
+            # add additional constraint incompatibility things
             for idx, i in enumerate(self.pos_feats_ecc_indices):
                 pos_feats_points = self.pos_feats_points_indices[
                         self.pos_feats_points_indptr[idx]:
@@ -193,8 +250,12 @@ class EccClusterer(object):
 
         logging.info('Solving optimization problem')
         sdp_obj_value = prob.solve(
-                solver=cp.SCS, verbose=True, max_iters=self.max_sdp_iters
+                solver=cp.SCS,
+                verbose=True,
+                max_iters=self.max_sdp_iters
         )
+
+        # TODO: add branch and bound here
 
         pw_probs = X.value
 
@@ -209,27 +270,7 @@ class EccClusterer(object):
         return sdp_obj_value, pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
-        forced_merge_dict = defaultdict(list)
-        if len(self.ecc_constraints) > 0:
-            force_beam_size = 2
-            for idx, i in enumerate(self.pos_feats_ecc_indices):
-                j_s = self.pos_feats_points_indices[
-                        self.pos_feats_points_indptr[idx]:
-                        self.pos_feats_points_indptr[idx+1]
-                ]
-                select_probs = [pw_probs[j, i] for j in j_s]
-                forced_merge_dict[i].extend(
-                        list(
-                            tuple(
-                                zip(*sorted(zip(j_s, select_probs),
-                                    key=lambda x: -x[1]))
-                            )[0][:force_beam_size]
-                        )
-                )
-        forced_merge_dict = dict(forced_merge_dict)
-        logging.info(f'forced_merge_dict: {forced_merge_dict}')
-
-        t = Trellis(adj_mx=pw_probs, forced_merge_dict=forced_merge_dict)
+        t = Trellis(adj_mx=pw_probs)
         t.fit()
         return t
 
@@ -486,7 +527,7 @@ def gen_forced_ecc_constraint(point_feats: csr_matrix,
                               gold_cluster_feats: csr_matrix,
                               pred_cluster_feats: csr_matrix,
                               matching_mx: np.ndarray,
-                              max_overlap_feats: int):
+                              max_pos_feats: int):
 
     # construct the point matching matrix
     point_matching_mx = get_point_matching_mx(
@@ -527,16 +568,16 @@ def gen_forced_ecc_constraint(point_feats: csr_matrix,
             np.sort(gold_and_pred),
             gold_and_pred_sfc
     )
-    sampled_overlap_feats = np.where(gold_and_pred_sfc == 1.0)[0][:max_overlap_feats]
+    sampled_overlap_feats = np.where(gold_and_pred_sfc == 1.0)[0][:1]
     # NOTE: why doesn't this line below work well with the SDP?
     # i.e. why don't the most common features work best
-    #sampled_overlap_feats = np.argsort(gold_and_pred_sfc)[-max_overlap_feats:]
+    #sampled_overlap_feats = np.argsort(gold_and_pred_sfc)[-1:]
 
     # now onto postive feats
     sampled_pos_feats = []
     gold_not_pred_lbls = np.asarray(
             [pred_cluster_lbls[i] for i in gold_not_pred])
-    for pred_lbl in np.unique(np.asarray(gold_not_pred_lbls)):
+    for pred_lbl in np.unique(np.asarray(gold_not_pred_lbls))[:max_pos_feats-1]:
         pred_cluster_mask = (gold_not_pred_lbls == pred_lbl)
         gold_not_pred_sfc = np.zeros((point_feats.shape[1],))
         get_salient_feats(
@@ -749,7 +790,7 @@ def simulate(edge_weights: csr_matrix,
              gold_clustering: np.ndarray,
              max_rounds: int,
              max_sdp_iters: int,
-             max_overlap_feats: int):
+             max_pos_feats: int):
 
     gold_cluster_feats = sp_vstack([
         get_cluster_feats(point_features[gold_clustering == i])
@@ -758,6 +799,8 @@ def simulate(edge_weights: csr_matrix,
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features,
+                             max_num_ecc=max_rounds,
+                             max_pos_feats=max_pos_feats,
                              max_sdp_iters=max_sdp_iters)
 
     pairwise_constraints_for_replay = []
@@ -830,7 +873,7 @@ def simulate(edge_weights: csr_matrix,
                     gold_cluster_feats,
                     pred_cluster_feats,
                     matching_mx,
-                    max_overlap_feats
+                    max_pos_feats
             )
             already_exists = any([
                 (ecc_constraint != x).nnz == 0
@@ -876,8 +919,8 @@ def get_hparams():
                         help="max num iterations for sdp solver")
 
     # for constraint generation
-    parser.add_argument('--max_overlap_feats', type=int, default=1,
-                        help="max num overlap features to sample.")
+    parser.add_argument('--max_pos_feats', type=int, default=6,
+                        help="max number of positive feats in ecc constraint.")
 
     hparams = parser.parse_args()
     return hparams
@@ -925,7 +968,7 @@ if __name__ == '__main__':
     num_blocks = len(blocks_preprocessed)
 
     sub_blocks_preprocessed = {}
-    sub_blocks_preprocessed['l wang'] = blocks_preprocessed['l wang']
+    sub_blocks_preprocessed['j taylor'] = blocks_preprocessed['j taylor']
 
     for i, (block_name, block_data) in enumerate(sub_blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
@@ -948,7 +991,7 @@ if __name__ == '__main__':
                 gold_clustering,
                 hparams.max_rounds,
                 hparams.max_sdp_iters,
-                hparams.max_overlap_feats,
+                hparams.max_pos_feats,
         )
 
         ecc_for_replay[block_name] = block_ecc_for_replay
