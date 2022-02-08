@@ -66,16 +66,12 @@ class EccClusterer(object):
         self.U = cp.Parameter((self.max_num_ecc, n))
         self.As = [cp.Parameter((n, self.max_num_ecc))
                 for _ in range(self.max_pos_feats)]
-        self.bs = [cp.Parameter((self.max_num_ecc,))
-                for _ in range(self.max_pos_feats)]
 
         # initialize parameters
         self.L.value = np.zeros((self.max_num_ecc, n))
         self.U.value = np.ones((self.max_num_ecc, n))
         for A in self.As:
-            A.value = np.zeros((n, self.max_num_ecc))
-        for b in self.bs:
-            b.value = np.zeros((self.max_num_ecc,))
+            A.value = np.ones((n, self.max_num_ecc))
 
         # build out constraint set
         constraints = [
@@ -85,28 +81,75 @@ class EccClusterer(object):
                 self.X[self.num_points:, :] <= self.U,
         ]
         constraints.extend([
-            cp.trace(self.X[self.num_points:, :] @ A) >= b
-                for A, b in zip(self.As, self.bs)
+            cp.diag(self.X[self.num_points:, :] @ A)
+                >= np.ones((self.max_num_ecc,)) for A in self.As
         ])
 
         # create problem
         self.prob = cp.Problem(cp.Maximize(cp.trace(W @ self.X)), constraints)
 
-        sdp_obj_value = self.prob.solve(
-                solver=cp.SCS,
-                verbose=True,
-                warm_start=True,
-                max_iters=self.max_sdp_iters,
-        )
-
-        embed()
-        exit()
-
-
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
         self.ecc_mx = sp_vstack(self.ecc_constraints)
-        self.n += 1
+        self.num_ecc += 1
+
+        # "negative" sdp constraints
+        uni_feats = sp_vstack([self.features, self.ecc_mx])
+        self.incompat_mx = np.zeros(
+                (self.num_points+self.num_ecc, self.num_ecc), dtype=bool)
+        self._set_incompat_mx(self.num_points+self.num_ecc,
+                              self.num_ecc,
+                              uni_feats.indptr,
+                              uni_feats.indices,
+                              uni_feats.data,
+                              self.ecc_mx.indptr,
+                              self.ecc_mx.indices,
+                              self.ecc_mx.data,
+                              self.incompat_mx)
+
+        # "positive" sdp constraints
+        bin_features = self.features.astype(bool).tocsc()
+        pos_ecc_mx = (self.ecc_mx > 0)
+        (ecc_indices,
+         points_indptr,
+         points_indices) = self._get_feat_satisfied_hyperplanes(
+                 bin_features.indptr,
+                 bin_features.indices,
+                 pos_ecc_mx.indptr,
+                 pos_ecc_mx.indices,
+                 self.incompat_mx)
+
+        ## add additional constraint incompatibility things
+        #for idx, i in enumerate(self.pos_feats_ecc_indices):
+        #    pos_feats_points = self.pos_feats_points_indices[
+        #            self.pos_feats_points_indptr[idx]:
+        #            self.pos_feats_points_indptr[idx+1]
+        #    ]
+        #    for j in range(i+1, self.num_points+self.num_ecc):
+        #        all_pos_incompat = True
+        #        for l in pos_feats_points:
+        #            if not self.incompat_mx[l, j-num_points]:
+        #                all_pos_incompat = False
+        #                break
+        #        if all_pos_incompat:
+        #            self.incompat_mx[i, j-self.num_points] = True
+        #            self.incompat_mx[j, i-self.num_points] = True
+
+        # update problem constraint parameters
+        active_U = self.U.value[:self.num_ecc, :self.num_points+self.num_ecc]
+        active_U[self.incompat_mx.T] = 0.0
+
+        pos_feat_idx = 0
+        curr_ecc_idx = 0
+        for ptr_idx, i in enumerate(ecc_indices):
+            if i != curr_ecc_idx:
+                pos_feat_idx = 0
+                curr_ecc_idx = i
+            start, end = points_indptr[ptr_idx], points_indptr[ptr_idx+1]
+            self.As[pos_feat_idx].value[:, i] = 0.0
+            for j in points_indices[start:end]:
+                self.As[pos_feat_idx].value[j, i] = 1.0
+            pos_feat_idx += 1
 
     @staticmethod
     @nb.njit(parallel=True)
@@ -170,99 +213,24 @@ class EccClusterer(object):
         return (ecc_indices, points_indptr, points_indices)
 
     def build_and_solve_sdp(self):
-        num_points = self.features.shape[0]
-        num_ecc = len(self.ecc_constraints)
-
-        if num_ecc > 0:
-            # "negative" sdp constraints
-            uni_feats = sp_vstack([self.features, self.ecc_mx])
-            self.incompat_mx = np.zeros(
-                    (num_points+num_ecc, num_ecc), dtype=bool)
-            self._set_incompat_mx(num_points+num_ecc,
-                                  num_ecc,
-                                  uni_feats.indptr,
-                                  uni_feats.indices,
-                                  uni_feats.data,
-                                  self.ecc_mx.indptr,
-                                  self.ecc_mx.indices,
-                                  self.ecc_mx.data,
-                                  self.incompat_mx)
-            ortho_indices = [(a, b+num_points)
-                    for a, b in zip(*np.where(self.incompat_mx))]
-
-            # "positive" sdp constraints
-            bin_features = self.features.astype(bool).tocsc()
-            pos_ecc_mx = (self.ecc_mx > 0)
-            (ecc_indices,
-             points_indptr,
-             points_indices) = self._get_feat_satisfied_hyperplanes(
-                     bin_features.indptr,
-                     bin_features.indices,
-                     pos_ecc_mx.indptr,
-                     pos_ecc_mx.indices,
-                     self.incompat_mx)
-            self.pos_feats_ecc_indices = [x + num_points for x in ecc_indices]
-            self.pos_feats_points_indptr = list(points_indptr)
-            self.pos_feats_points_indices = list(points_indices)
-
-            # add additional constraint incompatibility things
-            for idx, i in enumerate(self.pos_feats_ecc_indices):
-                pos_feats_points = self.pos_feats_points_indices[
-                        self.pos_feats_points_indptr[idx]:
-                        self.pos_feats_points_indptr[idx+1]
-                ]
-                for j in range(i+1, num_points + num_ecc):
-                    all_pos_incompat = True
-                    for l in pos_feats_points:
-                        if not self.incompat_mx[l, j-num_points]:
-                            all_pos_incompat = False
-                            break
-                    if all_pos_incompat:
-                        ortho_indices.append((i, j))
-                        ortho_indices.append((j, i))
-                        self.incompat_mx[i, j-num_points] = True
-                        self.incompat_mx[j, i-num_points] = True
-
-
-        # formulate SDP
-        logging.info('Constructing optimization problem')
-        W = csr_matrix((self.edge_weights.data,
-                        (self.edge_weights.row, self.edge_weights.col)),
-                        shape=(self.n, self.n))
-        X = cp.Variable((self.n, self.n), PSD=True)
-        # standard correlation clustering constraints
-        constraints = [
-                cp.diag(X) == np.ones((self.n,)),
-                X >= 0
-        ]
-        if num_ecc > 0:
-            # "negative" ecc constraints
-            constraints.extend([X[i,j] <= 0 for i, j in ortho_indices])
-            # "positive" ecc constraints
-            for idx, i in enumerate(self.pos_feats_ecc_indices):
-                j_s = self.pos_feats_points_indices[
-                        self.pos_feats_points_indptr[idx]:
-                        self.pos_feats_points_indptr[idx+1]
-                ]
-                constraints.append(sum([X[i,j] for j in j_s]) >= 1)
-
-        prob = cp.Problem(cp.Maximize(cp.trace(W @ X)), constraints)
-
         logging.info('Solving optimization problem')
-        sdp_obj_value = prob.solve(
+        sdp_obj_value = self.prob.solve(
                 solver=cp.SCS,
                 verbose=True,
-                max_iters=self.max_sdp_iters
+                warm_start=True,
+                max_iters=self.max_sdp_iters,
+                eps=1e-3
         )
 
         # TODO: add branch and bound here
 
-        pw_probs = X.value
+        active_n = self.num_points + self.num_ecc
+        pw_probs = self.X.value[:active_n, :active_n]
 
         if self.incompat_mx is not None:
             # discourage incompatible nodes from clustering together
             self.incompat_mx = np.concatenate(
-                    (np.zeros((num_points+num_ecc, num_points), dtype=bool),
+                    (np.zeros((active_n, self.num_points), dtype=bool),
                      self.incompat_mx), axis=1
             )
             pw_probs[self.incompat_mx] -= np.sum(pw_probs)
@@ -330,9 +298,6 @@ class EccClusterer(object):
                 rchild_ptr += 1
 
     def cut_trellis(self, t: Trellis):
-        num_ecc = len(self.ecc_constraints)
-        num_points = self.n - num_ecc
-
         membership_indptr = t.leaves_indptr
         membership_indices = t.leaves_indices
         membership_data = self.get_membership_data(membership_indptr,
@@ -344,8 +309,9 @@ class EccClusterer(object):
             node_start = membership_indptr[node]
             node_end = membership_indptr[node+1]
             leaves = membership_indices[node_start:node_end]
-            if num_ecc > 0:
-                num_ecc_sat[node] = self.get_num_ecc_sat(leaves, num_points)
+            if self.num_ecc > 0:
+                num_ecc_sat[node] = self.get_num_ecc_sat(
+                        leaves, self.num_points)
             obj_vals[node] = self.get_intra_cluster_energy(leaves)
             for lchild, rchild in t.get_child_pairs_iter(node):
                 cpair_num_ecc_sat = num_ecc_sat[lchild] + num_ecc_sat[rchild]
@@ -373,8 +339,8 @@ class EccClusterer(object):
         # `node_start` and `node_end` also correspond to the root of the
         # trellis.
         best_clustering = membership_data[node_start:node_end]
-        if num_ecc > 0:
-            best_clustering = best_clustering[:-num_ecc]
+        if self.num_ecc > 0:
+            best_clustering = best_clustering[:-self.num_ecc]
 
         return best_clustering, obj_vals[node], num_ecc_sat[node]
 
@@ -967,8 +933,9 @@ if __name__ == '__main__':
     pred_clusterings = {}
     num_blocks = len(blocks_preprocessed)
 
-    sub_blocks_preprocessed = {}
-    sub_blocks_preprocessed['j taylor'] = blocks_preprocessed['j taylor']
+    #sub_blocks_preprocessed = {}
+    sub_blocks_preprocessed = blocks_preprocessed
+    #sub_blocks_preprocessed['j taylor'] = blocks_preprocessed['j taylor']
 
     for i, (block_name, block_data) in enumerate(sub_blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
