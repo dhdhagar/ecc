@@ -7,6 +7,7 @@
 import argparse
 from collections import defaultdict
 import copy
+import heapq
 from itertools import product
 import json
 import logging
@@ -119,26 +120,27 @@ class EccClusterer(object):
                  pos_ecc_mx.indices,
                  self.incompat_mx)
 
-        ## add additional constraint incompatibility things
-        #for idx, i in enumerate(self.pos_feats_ecc_indices):
-        #    pos_feats_points = self.pos_feats_points_indices[
-        #            self.pos_feats_points_indptr[idx]:
-        #            self.pos_feats_points_indptr[idx+1]
-        #    ]
-        #    for j in range(i+1, self.num_points+self.num_ecc):
-        #        all_pos_incompat = True
-        #        for l in pos_feats_points:
-        #            if not self.incompat_mx[l, j-num_points]:
-        #                all_pos_incompat = False
-        #                break
-        #        if all_pos_incompat:
-        #            self.incompat_mx[i, j-self.num_points] = True
-        #            self.incompat_mx[j, i-self.num_points] = True
+        # if there if no way a single cluster can satisfy both constraints...
+        for idx, i in enumerate(ecc_indices):
+            pos_feats_points = points_indices[
+                    points_indptr[idx]:
+                    points_indptr[idx+1]
+            ]
+            for j in range(i+1, self.num_ecc):
+                all_pos_incompat = True
+                for l in pos_feats_points:
+                    if not self.incompat_mx[l, j]:
+                        all_pos_incompat = False
+                        break
+                if all_pos_incompat:
+                    self.incompat_mx[i, j] = True
+                    self.incompat_mx[j, i] = True
 
         # update problem constraint parameters
         active_U = self.U.value[:self.num_ecc, :self.num_points+self.num_ecc]
         active_U[self.incompat_mx.T] = 0.0
 
+        self.var_vals = defaultdict(list)
         pos_feat_idx = 0
         curr_ecc_idx = 0
         for ptr_idx, i in enumerate(ecc_indices):
@@ -149,7 +151,12 @@ class EccClusterer(object):
             self.As[pos_feat_idx].value[:, i] = 0.0
             for j in points_indices[start:end]:
                 self.As[pos_feat_idx].value[j, i] = 1.0
+                self.var_vals[(pos_feat_idx, i)].append(j)
             pos_feat_idx += 1
+
+        self.var_vals = dict(
+                sorted(self.var_vals.items(), key=lambda x: len(x[1]))
+        )
 
     @staticmethod
     @nb.njit(parallel=True)
@@ -222,10 +229,35 @@ class EccClusterer(object):
                 eps=1e-3
         )
 
-        # TODO: add branch and bound here
-
+        # number of active graph nodes we are clustering
         active_n = self.num_points + self.num_ecc
-        pw_probs = self.X.value[:active_n, :active_n]
+
+        # run heuristic max forcing for now
+        if self.num_ecc > 0:
+            var_assign = []
+            for ((_, ecc_idx), satisfying_points) in self.var_vals.items():
+                max_satisfy_pt = max(
+                        satisfying_points,
+                        key=lambda x: self.X.value[ecc_idx+self.num_points, x]
+                )
+                var_assign.append((ecc_idx, max_satisfy_pt))
+
+            for ecc_idx, point_idx in var_assign:
+                self.L.value[ecc_idx, point_idx] = 0.9
+
+            misdp_obj_value = self.prob.solve(
+                    solver=cp.SCS,
+                    verbose=True,
+                    warm_start=True,
+                    max_iters=self.max_sdp_iters,
+                    eps=1e-3
+            )
+            pw_probs = self.X.value[:active_n, :active_n]
+
+            for ecc_idx, point_idx in var_assign:
+                self.L.value[ecc_idx, point_idx] = 0.0
+        else: 
+            pw_probs = self.X.value[:active_n, :active_n]
 
         if self.incompat_mx is not None:
             # discourage incompatible nodes from clustering together
@@ -234,7 +266,9 @@ class EccClusterer(object):
                      self.incompat_mx), axis=1
             )
             pw_probs[self.incompat_mx] -= np.sum(pw_probs)
+
         pw_probs = np.triu(pw_probs, k=1)
+
         return sdp_obj_value, pw_probs
 
     def build_trellis(self, pw_probs: np.ndarray):
@@ -534,10 +568,10 @@ def gen_forced_ecc_constraint(point_feats: csr_matrix,
             np.sort(gold_and_pred),
             gold_and_pred_sfc
     )
-    sampled_overlap_feats = np.where(gold_and_pred_sfc == 1.0)[0][:1]
+    #sampled_overlap_feats = np.where(gold_and_pred_sfc == 1.0)[0][:1]
     # NOTE: why doesn't this line below work well with the SDP?
     # i.e. why don't the most common features work best
-    #sampled_overlap_feats = np.argsort(gold_and_pred_sfc)[-1:]
+    sampled_overlap_feats = np.argsort(gold_and_pred_sfc)[-1:]
 
     # now onto postive feats
     sampled_pos_feats = []
@@ -934,8 +968,8 @@ if __name__ == '__main__':
     num_blocks = len(blocks_preprocessed)
 
     #sub_blocks_preprocessed = {}
+    #sub_blocks_preprocessed['d schmidt'] = blocks_preprocessed['d schmidt']
     sub_blocks_preprocessed = blocks_preprocessed
-    #sub_blocks_preprocessed['j taylor'] = blocks_preprocessed['j taylor']
 
     for i, (block_name, block_data) in enumerate(sub_blocks_preprocessed.items()):
         edge_weights = block_data['edge_weights']
