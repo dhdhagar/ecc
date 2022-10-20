@@ -135,19 +135,22 @@ class Trellis(object):
         self.n = adj_mx.shape[0]
         self.topo_order = None
 
-    def fit(self):
+    def fit(self, only_avg_hac=False):
         # get the HAC tree, not necessarily contained in beam search
         g, w = hg.adjacency_matrix_2_undirected_graph(self.adj_mx)
         dists = -1.0 * w
 
         # build these five trees, maybe change later if it makes sense
-        trees = [
-            hg.binary_partition_tree_average_linkage(g, dists)[0].parents(),
-            hg.binary_partition_tree_single_linkage(g, dists)[0].parents(),
-            hg.binary_partition_tree_complete_linkage(g, dists)[0].parents(),
-            hg.binary_partition_tree_exponential_linkage(g, dists, -1.0)[0].parents(),
-            hg.binary_partition_tree_exponential_linkage(g, dists, 1.0)[0].parents()
-        ]
+        if only_avg_hac:
+            trees = [hg.binary_partition_tree_average_linkage(g, dists)[0].parents()]
+        else:
+            trees = [
+                hg.binary_partition_tree_average_linkage(g, dists)[0].parents(),
+                hg.binary_partition_tree_single_linkage(g, dists)[0].parents(),
+                hg.binary_partition_tree_complete_linkage(g, dists)[0].parents(),
+                hg.binary_partition_tree_exponential_linkage(g, dists, -1.0)[0].parents(),
+                hg.binary_partition_tree_exponential_linkage(g, dists, 1.0)[0].parents()
+            ]
         trees = np.vstack(trees)
 
         # build trellis
