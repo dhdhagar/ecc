@@ -63,12 +63,8 @@ class EccClusterer(object):
         logging.info('Constructing optimization problem')
 
         W = csr_matrix((self.edge_weights.data, (self.edge_weights.row, self.edge_weights.col)), shape=(n, n))
-        Wcoo = W.tocoo()
-        Wcoo_values = torch.FloatTensor(Wcoo.data)
-        Wcoo_indices = torch.LongTensor(np.vstack((Wcoo.row, Wcoo.col)))
-        self.W_val = torch.sparse_coo_tensor(Wcoo_indices, Wcoo_values, Wcoo.shape, requires_grad=True)
-        # self.W_val = torch.sparse_csr_tensor(self.edge_weights.row, self.edge_weights.col, self.edge_weights.data,
-        #                                       size=(n, n), requires_grad=True)
+        self.W_val = torch.tensor(W.todense(), requires_grad=True)
+
         self.X = cp.Variable((n, n), PSD=True)
 
         self.W = cp.Parameter((n, n))
