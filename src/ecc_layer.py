@@ -18,6 +18,8 @@ import pickle
 import time
 
 import cvxpy as cp
+import torch
+from cvxpylayers.torch import CvxpyLayer
 import higra as hg
 import numba as nb
 from numba.typed import List
@@ -59,37 +61,39 @@ class EccClusterer(object):
 
         # formulate SDP
         logging.info('Constructing optimization problem')
-        W = csr_matrix((self.edge_weights.data,
-                        (self.edge_weights.row, self.edge_weights.col)),
-                        shape=(n, n))
+        # W = csr_matrix((self.edge_weights.data, (self.edge_weights.row, self.edge_weights.col)), shape=(n, n))
+        self.W_val = torch.sparse_csr_tensor(self.edge_weights.row, self.edge_weights.col, self.edge_weights.data,
+                                              size=(n, n), requires_grad=True)
         self.X = cp.Variable((n, n), PSD=True)
 
-        # instantiate parameters
-        self.L = cp.Parameter((self.max_num_ecc, n))  # lower
-        self.U = cp.Parameter((self.max_num_ecc, n))  # upper
-        self.As = [cp.Parameter((n, self.max_num_ecc))
-                for _ in range(self.max_pos_feats)]
+        self.W = cp.Parameter((n, n))
 
-        # initialize parameters
-        self.L.value = np.zeros((self.max_num_ecc, n))
-        self.U.value = np.ones((self.max_num_ecc, n))
-        for A in self.As:
-            A.value = np.ones((n, self.max_num_ecc))
+        # # instantiate parameters
+        # self.L = cp.Parameter((self.max_num_ecc, n))  # lower
+        # self.U = cp.Parameter((self.max_num_ecc, n))  # upper
+        # self.As = [cp.Parameter((n, self.max_num_ecc))
+        #         for _ in range(self.max_pos_feats)]
+        #
+        # # initialize parameters
+        # self.L.value = np.zeros((self.max_num_ecc, n))
+        # self.U.value = np.ones((self.max_num_ecc, n))
+        # for A in self.As:
+        #     A.value = np.ones((n, self.max_num_ecc))
 
         # build out constraint set
         constraints = [
                 cp.diag(self.X) == np.ones((n,)),
                 self.X[:self.num_points, :] >= 0,
-                self.X[self.num_points:, :] >= self.L,
-                self.X[self.num_points:, :] <= self.U,
+                # self.X[self.num_points:, :] >= self.L,
+                # self.X[self.num_points:, :] <= self.U,
         ]
-        constraints.extend([
-            cp.diag(self.X[self.num_points:, :] @ A)
-                >= np.ones((self.max_num_ecc,)) for A in self.As
-        ])
+        # constraints.extend([
+        #     cp.diag(self.X[self.num_points:, :] @ A)
+        #         >= np.ones((self.max_num_ecc,)) for A in self.As
+        # ])
 
         # create problem
-        self.prob = cp.Problem(cp.Maximize(cp.trace(W @ self.X)), constraints)
+        self.prob = cp.Problem(cp.Maximize(cp.trace(self.W @ self.X)), constraints)
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -223,13 +227,26 @@ class EccClusterer(object):
 
     def build_and_solve_sdp(self):
         logging.info('Solving optimization problem')
-        sdp_obj_value = self.prob.solve(
-                solver=cp.SCS,
-                verbose=True,
-                warm_start=True,
-                max_iters=self.max_sdp_iters,
-                eps=1e-3
-        )
+        # Build a cvxpylayer
+        self.sdp_layer = CvxpyLayer(self.prob, parameters=[self.W], variables=[self.X])
+
+        sdp_obj_value = self.sdp_layer(self.W_val, solver_args={
+            "solver": cp.SCS,
+            "verbose": True,
+            "warm_start": True,
+            "max_iters": self.max_sdp_iters,
+            "eps": 1e-3
+        })
+        sdp_obj_value.backward()
+        embed()
+
+        # sdp_obj_value = self.prob.solve(
+        #         solver=cp.SCS,
+        #         verbose=True,
+        #         warm_start=True,
+        #         max_iters=self.max_sdp_iters,
+        #         eps=1e-3
+        # )
 
         # number of active graph nodes we are clustering
         active_n = self.num_points + self.num_ecc
@@ -793,7 +810,10 @@ def simulate(edge_weights: csr_matrix,
              max_rounds: int,
              max_sdp_iters: int,
              max_pos_feats: int,
-             only_avg_hac: bool = False):
+             only_avg_hac: bool = False,
+             max_ecc_constraints: int = -1):
+    if max_ecc_constraints == -1:
+        max_ecc_constraints = max_rounds
 
     gold_cluster_feats = sp_vstack([
         get_cluster_feats(point_features[gold_clustering == i])
@@ -867,7 +887,7 @@ def simulate(edge_weights: csr_matrix,
             logging.info('Achieved perfect clustering at round %d.', r)
             break
 
-        if r < max_rounds - 1:
+        if r < min(max_rounds, max_ecc_constraints) - 1:
             # generate a new constraint
             while True:
                 ecc_constraint, pairwise_constraints = gen_forced_ecc_constraint(
@@ -929,6 +949,8 @@ def get_hparams():
     # for end-to-end training
     parser.add_argument('--only_avg_hac', action='store_true',
                         help="Builds only the average linkage tree instead of a trellis of 5 trees")
+    parser.add_argument('--max_ecc_constraints', type=int, default=-1,
+                        help="Maximum number of existential cluster constraints. -1 defaults to using `max_rounds`")
 
     hparams = parser.parse_args()
     return hparams
@@ -949,10 +971,13 @@ if __name__ == '__main__':
                 open(os.path.join(hparams.output_dir, 'hparams.pkl'), "wb")
         )
         logging.basicConfig(
-                filename=os.path.join(hparams.output_dir, 'out.log'),
                 format='(ECC) :: %(asctime)s >> %(message)s',
                 datefmt='%m-%d-%y %H:%M:%S',
-                level=logging.INFO
+                level=logging.INFO,
+                handlers=[
+                    logging.FileHandler(os.path.join(hparams.output_dir, "out.log")),
+                    logging.StreamHandler()
+                ],
         )
     else:
         logging.basicConfig(
@@ -1002,6 +1027,7 @@ if __name__ == '__main__':
                 hparams.max_sdp_iters,
                 hparams.max_pos_feats,
                 only_avg_hac=hparams.only_avg_hac,
+                max_ecc_constraints=hparams.max_ecc_constraints
         )
 
         ecc_for_replay[block_name] = block_ecc_for_replay
