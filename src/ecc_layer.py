@@ -41,13 +41,12 @@ class TrellisCutLayer(torch.nn.Module):
     Takes the SDP solution as input and executes the trellis-cut rounding algorithm in the forward pass
     Executes a straight-through estimator in the backward pass
     """
-    def __init__(self, ecc_clusterer_obj, only_avg_hac=False):
+    def __init__(self, ecc_clusterer_obj):
         super().__init__()
         self.clusterer = ecc_clusterer_obj
-        self.only_avg_hac = only_avg_hac
 
-    def get_rounded_solution(self, pw_probs):
-        t = self.clusterer.build_trellis(pw_probs.detach().numpy(), only_avg_hac=self.only_avg_hac)
+    def get_rounded_solution(self, pw_probs, only_avg_hac=False):
+        t = self.clusterer.build_trellis(pw_probs.detach().numpy(), only_avg_hac=only_avg_hac)
         pred_clustering, cut_obj_value, num_ecc_satisfied = self.clusterer.cut_trellis(t)
 
         self.cut_obj_value = cut_obj_value
@@ -67,8 +66,8 @@ class TrellisCutLayer(torch.nn.Module):
                 _v = v
         return round_mat
 
-    def forward(self, X):
-        return X + (self.get_rounded_solution(X) - X).detach()
+    def forward(self, X, only_avg_hac=False):
+        return X + (self.get_rounded_solution(X, only_avg_hac) - X).detach()
 
 class EccClusterer(object):
 
@@ -131,6 +130,11 @@ class EccClusterer(object):
         self.prob = cp.Problem(cp.Maximize(cp.trace(self.W @ self.X)), constraints)
         # Note: maximizing the trace is equivalent to maximizing the sum_E (w_uv * X_uv) objective
         # because W is upper-triangular and X is symmetric
+
+        # Build the SDP cvxpylayer
+        self.sdp_layer = CvxpyLayer(self.prob, parameters=[self.W], variables=[self.X])
+        # Build the trellis-cut rounding layer
+        self.rounding_layer = TrellisCutLayer(ecc_clusterer_obj=self)
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -264,9 +268,8 @@ class EccClusterer(object):
 
     def build_and_solve_sdp(self):
         logging.info('Solving optimization problem')
-        # Build a cvxpylayer
-        self.sdp_layer = CvxpyLayer(self.prob, parameters=[self.W], variables=[self.X])
 
+        # Forward pass through the SDP cvxpylayer
         pw_probs = self.sdp_layer(self.W_val, solver_args={
             "solve_method": "SCS",
             "verbose": True,
@@ -274,7 +277,6 @@ class EccClusterer(object):
             "max_iters": self.max_sdp_iters,
             "eps": 1e-3
         })
-        pw_probs.retain_grad()  # debug: view the backward pass result
         pw_probs = torch.triu(pw_probs[0], diagonal=1)
         with torch.no_grad():
             sdp_obj_value = torch.sum(self.W_val * pw_probs).item()
@@ -327,6 +329,7 @@ class EccClusterer(object):
             pw_probs[self.incompat_mx] -= np.sum(pw_probs)
 
         # pw_probs = np.triu(pw_probs, k=1)
+        pw_probs.retain_grad()  # debug: view the backward pass result
 
         return sdp_obj_value, pw_probs
 
@@ -451,8 +454,8 @@ class EccClusterer(object):
         # # Cut trellis
         # pred_clustering, cut_obj_value, num_ecc_satisfied = self.cut_trellis(t)
 
-        rounding_layer = TrellisCutLayer(ecc_clusterer_obj=self, only_avg_hac=only_avg_hac)
-        rounded_solution = rounding_layer(pw_probs)
+        # Forward pass through the trellis-cut rounding procedure
+        rounded_solution = self.rounding_layer(pw_probs, only_avg_hac=only_avg_hac)
         rounded_solution.retain_grad()  # debug: view the backward pass result
         gold_solution = torch.zeros(pw_probs.size()).random_(0, 2)  # dummy
         loss = torch.norm(gold_solution - rounded_solution)
@@ -462,10 +465,10 @@ class EccClusterer(object):
         metrics = {
                 'sdp_solve_time': end_solve_time - start_solve_time,
                 'sdp_obj_value': sdp_obj_value,
-                'cut_obj_value': rounding_layer.cut_obj_value,
-                'num_ecc_satisfied': int(rounding_layer.num_ecc_satisfied),
+                'cut_obj_value': self.rounding_layer.cut_obj_value,
+                'num_ecc_satisfied': int(self.rounding_layer.num_ecc_satisfied),
                 'num_ecc': num_ecc,
-                'frac_ecc_satisfied': rounding_layer.num_ecc_satisfied / num_ecc
+                'frac_ecc_satisfied': self.rounding_layer.num_ecc_satisfied / num_ecc
                         if num_ecc > 0 else 0.0,
                 'num_ecc_feats': self.ecc_mx.nnz 
                         if self.ecc_mx is not None else 0,
@@ -475,7 +478,7 @@ class EccClusterer(object):
                         if self.ecc_mx is not None else 0,
         }
 
-        return rounding_layer.pred_clustering, metrics
+        return self.rounding_layer.pred_clustering, metrics
 
 
 def get_cluster_feats(point_feats: csr_matrix):
