@@ -47,7 +47,7 @@ class TrellisCutLayer(torch.nn.Module):
         self.only_avg_hac = only_avg_hac
 
     def get_rounded_solution(self, pw_probs):
-        t = self.clusterer.build_trellis(pw_probs, only_avg_hac=self.only_avg_hac)
+        t = self.clusterer.build_trellis(pw_probs.detach().numpy(), only_avg_hac=self.only_avg_hac)
         pred_clustering, cut_obj_value, num_ecc_satisfied = self.clusterer.cut_trellis(t)
 
         self.cut_obj_value = cut_obj_value
