@@ -36,6 +36,40 @@ from trellis import Trellis
 from IPython import embed
 
 
+class TrellisCutLayer(torch.nn.Module):
+    """
+    Takes the SDP solution as input and executes the trellis-cut rounding algorithm in the forward pass
+    Executes a straight-through estimator in the backward pass
+    """
+    def __init__(self, ecc_clusterer_obj, only_avg_hac=False):
+        super().__init__()
+        self.clusterer = ecc_clusterer_obj
+        self.only_avg_hac = only_avg_hac
+
+    def get_rounded_solution(self, pw_probs):
+        t = self.clusterer.build_trellis(pw_probs, only_avg_hac=self.only_avg_hac)
+        pred_clustering, cut_obj_value, num_ecc_satisfied = self.clusterer.cut_trellis(t)
+
+        self.cut_obj_value = cut_obj_value
+        self.num_ecc_satisfied = num_ecc_satisfied
+        self.pred_clustering = pred_clustering
+
+        # Return an NxN matrix of 0s and 1s based on the predicted clustering
+        round_mat = torch.eye(len(self.pred_clustering), dtype=torch.float)
+        _v = None
+        _i = None
+        for i, v in enumerate(self.pred_clustering):
+            if v == _v:
+                round_mat[_i, i] = 1.
+                round_mat[i, _i] = 1.
+            else:
+                _i = i
+                _v = v
+        return round_mat
+
+    def forward(self, X):
+        return X + (self.get_rounded_solution(X) - X).detach()
+
 class EccClusterer(object):
 
     def __init__(self,
@@ -95,6 +129,8 @@ class EccClusterer(object):
 
         # create problem
         self.prob = cp.Problem(cp.Maximize(cp.trace(self.W @ self.X)), constraints)
+        # Note: maximizing the trace is equivalent to maximizing the sum_E (w_uv * X_uv) objective
+        # because W is upper-triangular and X is symmetric
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -231,15 +267,16 @@ class EccClusterer(object):
         # Build a cvxpylayer
         self.sdp_layer = CvxpyLayer(self.prob, parameters=[self.W], variables=[self.X])
 
-        sdp_obj_value = self.sdp_layer(self.W_val, solver_args={
-            "solver": cp.SCS,
+        pw_probs = self.sdp_layer(self.W_val, solver_args={
+            "solve_method": "SCS",
             "verbose": True,
-            "warm_start": True,
+            # "warm_start": True,  # Enabled by default
             "max_iters": self.max_sdp_iters,
             "eps": 1e-3
         })
-        sdp_obj_value.backward()
-        embed()
+        pw_probs = torch.triu(pw_probs[0], diagonal=1)
+        with torch.no_grad():
+            sdp_obj_value = torch.sum(self.W_val * pw_probs).item()
 
         # sdp_obj_value = self.prob.solve(
         #         solver=cp.SCS,
@@ -277,7 +314,8 @@ class EccClusterer(object):
             for ecc_idx, point_idx in var_assign:
                 self.L.value[ecc_idx, point_idx] = 0.0
         else: 
-            pw_probs = self.X.value[:active_n, :active_n]
+            # pw_probs = self.X.value[:active_n, :active_n]
+            pw_probs = pw_probs[:active_n, :active_n]
 
         if self.incompat_mx is not None:
             # discourage incompatible nodes from clustering together
@@ -287,7 +325,7 @@ class EccClusterer(object):
             )
             pw_probs[self.incompat_mx] -= np.sum(pw_probs)
 
-        pw_probs = np.triu(pw_probs, k=1)
+        # pw_probs = np.triu(pw_probs, k=1)
 
         return sdp_obj_value, pw_probs
 
@@ -406,19 +444,24 @@ class EccClusterer(object):
         sdp_obj_value, pw_probs = self.build_and_solve_sdp()
         end_solve_time = time.time()
 
-        # Build trellis
-        t = self.build_trellis(pw_probs, only_avg_hac=only_avg_hac)
+        # # Build trellis
+        # t = self.build_trellis(pw_probs, only_avg_hac=only_avg_hac)
+        #
+        # # Cut trellis
+        # pred_clustering, cut_obj_value, num_ecc_satisfied = self.cut_trellis(t)
 
-        # Cut trellis
-        pred_clustering, cut_obj_value, num_ecc_satisfied = self.cut_trellis(t)
+        rounding_layer = TrellisCutLayer(ecc_clusterer_obj=self, only_avg_hac=only_avg_hac)
+        loss = torch.norm(np.ones(pw_probs.size()) - rounding_layer(pw_probs))
+        embed()
+
 
         metrics = {
                 'sdp_solve_time': end_solve_time - start_solve_time,
                 'sdp_obj_value': sdp_obj_value,
-                'cut_obj_value': cut_obj_value,
-                'num_ecc_satisfied': int(num_ecc_satisfied),
+                'cut_obj_value': rounding_layer.cut_obj_value,
+                'num_ecc_satisfied': int(rounding_layer.num_ecc_satisfied),
                 'num_ecc': num_ecc,
-                'frac_ecc_satisfied': num_ecc_satisfied / num_ecc
+                'frac_ecc_satisfied': rounding_layer.num_ecc_satisfied / num_ecc
                         if num_ecc > 0 else 0.0,
                 'num_ecc_feats': self.ecc_mx.nnz 
                         if self.ecc_mx is not None else 0,
@@ -428,7 +471,7 @@ class EccClusterer(object):
                         if self.ecc_mx is not None else 0,
         }
 
-        return pred_clustering, metrics
+        return rounding_layer.pred_clustering, metrics
 
 
 def get_cluster_feats(point_feats: csr_matrix):
@@ -812,9 +855,9 @@ def simulate(edge_weights: csr_matrix,
              max_sdp_iters: int,
              max_pos_feats: int,
              only_avg_hac: bool = False,
-             max_ecc_constraints: int = -1):
-    if max_ecc_constraints == -1:
-        max_ecc_constraints = max_rounds
+             max_num_ecc: int = -1):
+    if max_num_ecc == -1:
+        max_num_ecc = max_rounds
 
     gold_cluster_feats = sp_vstack([
         get_cluster_feats(point_features[gold_clustering == i])
@@ -823,7 +866,7 @@ def simulate(edge_weights: csr_matrix,
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features,
-                             max_num_ecc=max_rounds,
+                             max_num_ecc=max_num_ecc,  # max_rounds
                              max_pos_feats=max_pos_feats,
                              max_sdp_iters=max_sdp_iters)
 
@@ -888,7 +931,7 @@ def simulate(edge_weights: csr_matrix,
             logging.info('Achieved perfect clustering at round %d.', r)
             break
 
-        if r < min(max_rounds, max_ecc_constraints) - 1:
+        if r < min(max_rounds, max_num_ecc) - 1:
             # generate a new constraint
             while True:
                 ecc_constraint, pairwise_constraints = gen_forced_ecc_constraint(
@@ -950,7 +993,7 @@ def get_hparams():
     # for end-to-end training
     parser.add_argument('--only_avg_hac', action='store_true',
                         help="Builds only the average linkage tree instead of a trellis of 5 trees")
-    parser.add_argument('--max_ecc_constraints', type=int, default=-1,
+    parser.add_argument('--max_num_ecc', type=int, default=-1,
                         help="Maximum number of existential cluster constraints. -1 defaults to using `max_rounds`")
 
     hparams = parser.parse_args()
@@ -1028,7 +1071,7 @@ if __name__ == '__main__':
                 hparams.max_sdp_iters,
                 hparams.max_pos_feats,
                 only_avg_hac=hparams.only_avg_hac,
-                max_ecc_constraints=hparams.max_ecc_constraints
+                max_num_ecc=hparams.max_num_ecc
         )
 
         ecc_for_replay[block_name] = block_ecc_for_replay
