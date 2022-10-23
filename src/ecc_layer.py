@@ -451,7 +451,9 @@ class EccClusterer(object):
         # pred_clustering, cut_obj_value, num_ecc_satisfied = self.cut_trellis(t)
 
         rounding_layer = TrellisCutLayer(ecc_clusterer_obj=self, only_avg_hac=only_avg_hac)
-        loss = torch.norm(torch.zeros(pw_probs.size()).random_(0, 2) - rounding_layer(pw_probs))
+        rounded_solution = rounding_layer(pw_probs)
+        gold_solution = torch.zeros(pw_probs.size()).random_(0, 2)  # dummy
+        loss = torch.norm(gold_solution - rounded_solution)
         embed()
 
 
