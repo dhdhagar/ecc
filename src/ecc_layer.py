@@ -42,14 +42,15 @@ def cluster_labels_to_matrix(labels):
     return: symmetric matrix of length equal to the number of labels with 1 indicating coreference and 0 otherwise
     """
     round_mat = torch.eye(len(labels), dtype=torch.float)
-    _v, _i = None, None
+    indices_by_label = defaultdict(list)
     for i, v in enumerate(labels):
-        if v == _v:
-            round_mat[_i, i] = 1.
-            round_mat[i, _i] = 1.
-        else:
-            _i = i
-            _v = v
+        indices_by_label[v].append(i)
+    for label in indices_by_label:
+        cluster_indices = indices_by_label[label]
+        for i, u in enumerate(cluster_indices[:-1]):
+            for v in cluster_indices[i+1:]:
+                round_mat[u, v] = 1.
+                round_mat[v, u] = 1.
     return round_mat
 
 class TrellisCutLayer(torch.nn.Module):
