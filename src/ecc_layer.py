@@ -274,6 +274,7 @@ class EccClusterer(object):
             "max_iters": self.max_sdp_iters,
             "eps": 1e-3
         })
+        pw_probs.retain_grad()  # debug: view the backward pass result
         pw_probs = torch.triu(pw_probs[0], diagonal=1)
         with torch.no_grad():
             sdp_obj_value = torch.sum(self.W_val * pw_probs).item()
@@ -452,6 +453,7 @@ class EccClusterer(object):
 
         rounding_layer = TrellisCutLayer(ecc_clusterer_obj=self, only_avg_hac=only_avg_hac)
         rounded_solution = rounding_layer(pw_probs)
+        rounded_solution.retain_grad()  # debug: view the backward pass result
         gold_solution = torch.zeros(pw_probs.size()).random_(0, 2)  # dummy
         loss = torch.norm(gold_solution - rounded_solution)
         embed()
