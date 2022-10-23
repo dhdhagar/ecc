@@ -36,6 +36,22 @@ from trellis import Trellis
 from IPython import embed
 
 
+def cluster_labels_to_matrix(labels):
+    """
+    labels: list of cluster labels for each vertex
+    return: symmetric matrix of length equal to the number of labels with 1 indicating coreference and 0 otherwise
+    """
+    round_mat = torch.eye(len(labels), dtype=torch.float)
+    _v, _i = None, None
+    for i, v in enumerate(labels):
+        if v == _v:
+            round_mat[_i, i] = 1.
+            round_mat[i, _i] = 1.
+        else:
+            _i = i
+            _v = v
+    return round_mat
+
 class TrellisCutLayer(torch.nn.Module):
     """
     Takes the SDP solution as input and executes the trellis-cut rounding algorithm in the forward pass
@@ -54,16 +70,8 @@ class TrellisCutLayer(torch.nn.Module):
         self.pred_clustering = pred_clustering
 
         # Return an NxN matrix of 0s and 1s based on the predicted clustering
-        round_mat = torch.eye(len(self.pred_clustering), dtype=torch.float)
-        _v = None
-        _i = None
-        for i, v in enumerate(self.pred_clustering):
-            if v == _v:
-                round_mat[_i, i] = 1.
-                round_mat[i, _i] = 1.
-            else:
-                _i = i
-                _v = v
+        round_mat = cluster_labels_to_matrix(self.pred_clustering)
+
         return round_mat
 
     def forward(self, X, only_avg_hac=False):
@@ -74,12 +82,15 @@ class EccClusterer(object):
     def __init__(self,
                  edge_weights: csr_matrix,
                  features: np.ndarray,
+                 gold_clustering: np.ndarray,
                  max_num_ecc: int,
                  max_pos_feats: int,
                  max_sdp_iters: int):
 
         self.edge_weights = edge_weights.tocoo()
         self.features = features
+        self.gold_clustering = gold_clustering
+        self.gold_clustering_matrix = cluster_labels_to_matrix(self.gold_clustering)
         self.max_num_ecc = max_num_ecc
         self.max_pos_feats = max_pos_feats
         self.max_sdp_iters = max_sdp_iters
@@ -167,7 +178,7 @@ class EccClusterer(object):
                  pos_ecc_mx.indices,
                  self.incompat_mx)
 
-        # if there if no way a single cluster can satisfy both constraints...
+        # if there is no way a single cluster can satisfy both constraints...
         for idx, i in enumerate(ecc_indices):
             pos_feats_points = points_indices[
                     points_indptr[idx]:
@@ -455,10 +466,12 @@ class EccClusterer(object):
         # pred_clustering, cut_obj_value, num_ecc_satisfied = self.cut_trellis(t)
 
         # Forward pass through the trellis-cut rounding procedure
-        rounded_solution = self.rounding_layer(pw_probs, only_avg_hac=only_avg_hac)
+        rounded_solution = torch.triu(self.rounding_layer(pw_probs, only_avg_hac=only_avg_hac), diagonal=1)
         rounded_solution.retain_grad()  # debug: view the backward pass result
-        gold_solution = torch.zeros(pw_probs.size()).random_(0, 2)  # dummy
+        # dummy_target = torch.zeros(len(pw_probs)).random_(0, 2)
+        gold_solution = torch.triu(self.gold_clustering_matrix, diagonal=1)
         loss = torch.norm(gold_solution - rounded_solution)
+        loss.retain_grad()  # debug: view the backward pass result
         embed()
 
 
@@ -873,6 +886,7 @@ def simulate(edge_weights: csr_matrix,
 
     clusterer = EccClusterer(edge_weights=edge_weights,
                              features=point_features,
+                             gold_clustering=gold_clustering,
                              max_num_ecc=max_num_ecc,  # max_rounds
                              max_pos_feats=max_pos_feats,
                              max_sdp_iters=max_sdp_iters)
