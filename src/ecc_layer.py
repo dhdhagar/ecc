@@ -341,7 +341,7 @@ class EccClusterer(object):
             pw_probs[self.incompat_mx] -= np.sum(pw_probs)
 
         # pw_probs = np.triu(pw_probs, k=1)
-        pw_probs.retain_grad()  # debug: view the backward pass result
+        # pw_probs.retain_grad()  # debug: view the backward pass result
 
         return sdp_obj_value, pw_probs
 
@@ -455,6 +455,11 @@ class EccClusterer(object):
     def pred(self, only_avg_hac: bool = False):
         num_ecc = len(self.ecc_constraints)
 
+        # Zero grad parameters
+        params = [self.W_val]
+        for param in params:
+            param.grad = None
+
         # Construct and solve SDP
         start_solve_time = time.time()
         sdp_obj_value, pw_probs = self.build_and_solve_sdp()
@@ -468,11 +473,19 @@ class EccClusterer(object):
 
         # Forward pass through the trellis-cut rounding procedure
         rounded_solution = torch.triu(self.rounding_layer(pw_probs, only_avg_hac=only_avg_hac), diagonal=1)
-        rounded_solution.retain_grad()  # debug: view the backward pass result
+        # rounded_solution.retain_grad()  # debug: view the backward pass result
         # dummy_target = torch.zeros(len(pw_probs)).random_(0, 2)
         gold_solution = torch.triu(self.gold_clustering_matrix, diagonal=1)
-        loss = torch.norm(gold_solution - rounded_solution)
-        loss.retain_grad()  # debug: view the backward pass result
+        loss = torch.norm(gold_solution - rounded_solution)  # frobenius norm
+        print("------------")
+        print(f"LOSS VALUE = {loss.item()}")
+        print("------------")
+        print("UPDATING WEIGHTS")
+        with torch.no_grad():
+            lr = 1e-3
+            self.W_val -= lr * self.W_val.grad
+        print("------------")
+        # loss.retain_grad()  # debug: view the backward pass result
         embed()
 
 
