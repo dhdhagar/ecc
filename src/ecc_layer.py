@@ -477,6 +477,7 @@ class EccClusterer(object):
         # dummy_target = torch.zeros(len(pw_probs)).random_(0, 2)
         gold_solution = torch.triu(self.gold_clustering_matrix, diagonal=1)
         loss = torch.norm(gold_solution - rounded_solution)  # frobenius norm
+        loss.backward()
         print("------------")
         print(f"LOSS VALUE = {loss.item()}")
         print("------------")
@@ -486,8 +487,6 @@ class EccClusterer(object):
             self.W_val -= lr * self.W_val.grad
         print("------------")
         # loss.retain_grad()  # debug: view the backward pass result
-        embed()
-
 
         metrics = {
                 'sdp_solve_time': end_solve_time - start_solve_time,
