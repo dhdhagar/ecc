@@ -155,7 +155,7 @@ class Trellis(object):
     def fit(self, only_avg_hac=False):
         # get the HAC tree, not necessarily contained in beam search
         g, w = hg.adjacency_matrix_2_undirected_graph(self.adj_mx)
-        dists = -1.0 * w
+        dists = 1-w  # -1. * w
 
         # build these five trees, maybe change later if it makes sense
         if only_avg_hac:

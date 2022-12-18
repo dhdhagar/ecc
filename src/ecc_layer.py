@@ -603,7 +603,8 @@ class EccClusterer(object):
         with torch.no_grad():
             assert torch.equal(torch.triu(self.hac_rounding_layer(pw_probs, self.W_val), diagonal=1),
                                rounded_solution)
-            assert self.rounding_layer.cut_obj_value == self.hac_rounding_layer.objective_value
+            print('TrellisCut obj:', self.rounding_layer.cut_obj_value)
+            print('HACCut obj:', self.hac_rounding_layer.objective_value.item())
         # rounded_solution.retain_grad()  # debug: view the backward pass result
         # dummy_target = torch.zeros(len(pw_probs)).random_(0, 2)
         gold_solution = torch.triu(self.gold_clustering_matrix, diagonal=1)
