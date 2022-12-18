@@ -1,9 +1,9 @@
 # Run ecc simualtion using synthetically generated e-constraints as a cvxpylayer.
 #
 # Usage:
-#       python ecc_layer.py --data_path ../data/arnetminer_processed.pkl \
-#           --output_dir="../experiments/exp_ecc_arnetminer" --max_sdp_iters=50000 \
-#           --max_rounds=1 --only_avg_hac
+# python ecc_layer.py --data_path ../data/arnetminer_processed.pkl \
+#   --output_dir="../experiments/exp_ecc_arnetminer" --max_sdp_iters=50000 \
+#   --max_rounds=1 --only_avg_hac
 #
 
 import argparse
@@ -24,7 +24,7 @@ import higra as hg
 import numba as nb
 from numba.typed import List
 import numpy as np
-import pytorch_lightning as pl
+# import pytorch_lightning as pl
 from scipy.sparse import csr_matrix, coo_matrix, dok_matrix
 from scipy.sparse import vstack as sp_vstack
 from scipy.special import softmax
@@ -52,6 +52,130 @@ def cluster_labels_to_matrix(labels):
                 round_mat[u, v] = 1.
                 round_mat[v, u] = 1.
     return round_mat
+
+
+class HACCutLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.round_matrix = None
+        self.cluster_labels = None
+        self.parents = None
+        self.objective_value = None
+
+    """
+    Takes fractional SDP output as input, and simultaneously builds & cuts avg. HAC tree to get rounded solution.
+    Executes straight-through estimator as the backward pass.
+    """
+    def get_rounded_solution(self, X, weights, _MAX_DIST=10, use_similarities=True, max_similarity=1, verbose=False):
+        # Initialization
+        device = X.device
+        D = X.size(1)
+        parents = torch.arange(D + (D - 1))
+        parent_to_idx = torch.arange(D + (D - 1))
+        idx_to_parent = torch.arange(D)
+        cluster_sizes = torch.ones(D + (D - 1))
+
+        energy = torch.zeros(D + (D - 1), device=device)
+        clustering = torch.zeros((D + (D - 1), D))
+        clustering[torch.arange(D), torch.arange(D)] = torch.arange(1, D + 1, dtype=clustering.dtype)
+        round_matrix = torch.eye(D, device=device)
+
+        # Take the upper triangular and mask the other values with a large number
+        Y = _MAX_DIST * torch.ones(D, D, device=device).tril() + (max_similarity-X if use_similarities else X).triu(1)
+        # Compute the dissimilarity minima per row
+        values, indices = torch.min(Y, dim=1)
+
+        if verbose:
+            print('Initialization:')
+            print('Y:', Y)
+            print('\tparents:', parents)
+            print('\tparent_to_idx:', parent_to_idx)
+            print('\tidx_to_parent:', idx_to_parent)
+            print('\tminima (values):', values)
+            print('\tminima (indices):', indices)
+            print('\tcluster_sizes:', cluster_sizes)
+            print()
+
+        ####################################
+
+        max_node = D - 1
+        if verbose:
+            print('Starting algorithm:')
+        for i in range(D - 1):
+            max_node += 1
+            min_minima_idx = torch.argmin(values).item()
+
+            # Merge the index of the minimum value of minimums across rows with the index of the minimum value in its row
+            merge_idx_1 = min_minima_idx
+            merge_idx_2 = indices[merge_idx_1].item()
+
+            # Find highest-altitude clusters corresponding to the merge indices
+            parent_1 = idx_to_parent[parent_to_idx[idx_to_parent[merge_idx_1]]].item()
+            parent_2 = idx_to_parent[parent_to_idx[idx_to_parent[merge_idx_2]]].item()
+
+            if verbose:
+                print(f'    #{i} Merging:', (merge_idx_1, merge_idx_2), 'i.e.', (parent_1, parent_2), '=>', max_node)
+
+            # Add parent for the clusters being merged
+            parents[parent_1] = max_node
+            parents[parent_2] = max_node
+
+            # Update mappings
+            idx_to_parent[merge_idx_1] = max_node
+            parent_to_idx[max_node] = merge_idx_1
+
+            # Update the matrix with merged values for cluster similarities
+            max_dist_mask = Y == _MAX_DIST
+            new_cluster_size = cluster_sizes[parent_1] + cluster_sizes[parent_2]
+            cluster_sizes[max_node] = new_cluster_size
+            new_merge_idx_1_values = (torch.min(Y[merge_idx_1, :], Y[:, merge_idx_1]) * cluster_sizes[parent_1] + \
+                                      torch.min(Y[:, merge_idx_2], Y[merge_idx_2, :]) * cluster_sizes[parent_2]) / \
+                                     new_cluster_size
+            Y[:, merge_idx_1] = new_merge_idx_1_values
+            Y[merge_idx_1, :] = new_merge_idx_1_values
+            Y[max_dist_mask] = _MAX_DIST
+            Y[:, merge_idx_2] = _MAX_DIST
+            Y[merge_idx_2, :] = _MAX_DIST
+
+            # Update nearest neighbour trackers
+            values[merge_idx_2] = _MAX_DIST
+
+            max_dist_mask = values == _MAX_DIST
+            values, indices = torch.min(Y, dim=1)
+            values[max_dist_mask] = _MAX_DIST
+
+            # Energy calculations
+            clustering[max_node] = clustering[parent_1] + clustering[parent_2]
+            leaf_indices = torch.where(clustering[max_node])[0]
+            leaf_edges = torch.meshgrid(leaf_indices, leaf_indices)
+            energy[max_node] = energy[parent_1] + energy[parent_2]
+            merge_energy = torch.sum(weights[leaf_edges])
+            if merge_energy >= energy[max_node]:
+                energy[max_node] = merge_energy
+                clustering[max_node][clustering[max_node] > 0] = max_node
+                round_matrix[leaf_edges] = 1
+            if verbose:
+                print('Y:', Y)
+                print('\tminima (values):', values)
+                print('\tminima (indices):', indices)
+                print('\tparents:', parents)
+                print('\tparent_to_idx:', parent_to_idx)
+                print('\tidx_to_parent:', idx_to_parent)
+                print('\tcluster_sizes:', cluster_sizes)
+                print('\tclustering (current):', clustering[max_node])
+                print('round_matrix:')
+                print(round_matrix)
+                print()
+
+        self.round_matrix = round_matrix
+        self.cluster_labels = clustering[-1]
+        self.parents = parents
+        self.objective_value = energy[max_node]
+        return self.round_matrix
+
+    def forward(self, X, W):
+        return X + (self.get_rounded_solution(X, W) - X).detach()
+
 
 class TrellisCutLayer(torch.nn.Module):
     """
@@ -147,6 +271,7 @@ class EccClusterer(object):
         self.sdp_layer = CvxpyLayer(self.prob, parameters=[self.W], variables=[self.X])
         # Build the trellis-cut rounding layer
         self.rounding_layer = TrellisCutLayer(ecc_clusterer_obj=self)
+        self.hac_rounding_layer = HACCutLayer()
 
     def add_constraint(self, ecc_constraint: csr_matrix):
         self.ecc_constraints.append(ecc_constraint)
@@ -401,7 +526,7 @@ class EccClusterer(object):
             else:
                 assert parent_indices[i] == rchild_indices[rchild_ptr]
                 assert (lchild_ptr == lchild_indices.size
-                        or lchild_indices[lchild_ptr] != rchild_indices[rchild_ptr])
+                        or lchild_indices[lchild_ptr] != rchild_indices[rchild_ptr])  # Q: Unclear about the conditions here
                 parent_data[i] = rchild_data[rchild_ptr]
                 rchild_ptr += 1
 
@@ -427,13 +552,15 @@ class EccClusterer(object):
                 if (num_ecc_sat[node] < cpair_num_ecc_sat 
                     or (num_ecc_sat[node] == cpair_num_ecc_sat
                         and obj_vals[node] < cpair_obj_val)):
+                    # If sum of children are better than node, then retain(merge) the children as separate in the node
                     num_ecc_sat[node] = cpair_num_ecc_sat
                     obj_vals[node] = cpair_obj_val
                     lchild_start = membership_indptr[lchild]
                     lchild_end = membership_indptr[lchild+1]
                     rchild_start = membership_indptr[rchild]
                     rchild_end = membership_indptr[rchild+1]
-                    self.merge_memberships(
+                    self.merge_memberships(  # Q: No need to merge every time? Can do it just once if children
+                                             # are determined to be better
                             membership_indices[lchild_start:lchild_end],
                             membership_data[lchild_start:lchild_end],
                             membership_indices[rchild_start:rchild_end],
@@ -473,6 +600,10 @@ class EccClusterer(object):
 
         # Forward pass through the trellis-cut rounding procedure
         rounded_solution = torch.triu(self.rounding_layer(pw_probs, only_avg_hac=only_avg_hac), diagonal=1)
+        with torch.no_grad():
+            assert torch.equal(torch.triu(self.hac_rounding_layer(pw_probs, self.W_val), diagonal=1),
+                               rounded_solution)
+            assert self.rounding_layer.cut_obj_value == self.hac_rounding_layer.objective_value
         # rounded_solution.retain_grad()  # debug: view the backward pass result
         # dummy_target = torch.zeros(len(pw_probs)).random_(0, 2)
         gold_solution = torch.triu(self.gold_clustering_matrix, diagonal=1)
@@ -1067,7 +1198,7 @@ if __name__ == '__main__':
     logging.info('Experiment args:\n{}'.format(
         json.dumps(vars(hparams), sort_keys=True, indent=4)))
 
-    pl.utilities.seed.seed_everything(hparams.seed)
+    # pl.utilities.seed.seed_everything(hparams.seed)
 
     with open(hparams.data_path, 'rb') as f:
         logging.info('Loading preprocessed data.')

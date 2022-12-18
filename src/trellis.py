@@ -21,6 +21,7 @@ def get_trellis_node_id(
     num_trellis_nodes = leaves_indptr.size - 1
     num_new_leaves = new_leaves.size
     node_id = -1
+    # Check if current nodes in trellis contain new_leaves
     for i in range(num_trellis_nodes):
         ptr = leaves_indptr[i]
         next_ptr = leaves_indptr[i+1]
@@ -33,6 +34,7 @@ def get_trellis_node_id(
             if match:
                 node_id = i
                 break
+    # If new_leaves not found in the leaves of nodes currently in the trellis
     if node_id == -1:
         # node does not exist yet; create new trellis node in `leaves_*`
         node_id = num_trellis_nodes
@@ -48,7 +50,14 @@ def build_trellis_from_trees(trees: np.ndarray):
     num_tree_nodes = trees.shape[1]
     num_leaves = (num_tree_nodes + 1) // 2
     leaves_indptr = np.arange(num_leaves+1, dtype=np.int64)
+    """
+        index: trellis node id; value: starting index of the sequence of leaves in leaves_indices for the node
+    """
+
     leaves_indices = np.arange(num_leaves, dtype=np.int64)
+    """
+        values: the leaf indices of each trellis node in sequence
+    """
     child_pairs_indptr = np.zeros((num_leaves+1,), dtype=np.int64)
     child_pairs_indices = np.empty((0,), dtype=np.int64)
     curr_leaves_mask = np.empty((num_leaves,), dtype=np.bool_)
@@ -58,8 +67,11 @@ def build_trellis_from_trees(trees: np.ndarray):
     for b in range(num_trees):
         membership = np.arange(num_leaves)
         for curr in range(num_leaves, num_tree_nodes):
+            # curr is a parent node in the tree (i.e. not a leaf node)
+            #   Iterate from the first parent in the tree to the root
             child_mask = (trees[b] == curr)
             children = np.where(child_mask)[0]
+            # Contains the node indices of the children of the current parent
             for i in range(num_leaves):
                 if membership[i] == children[0]:
                     lchild_leaves_mask[i] = True
@@ -75,12 +87,13 @@ def build_trellis_from_trees(trees: np.ndarray):
                     curr_leaves_mask[i] = False
 
             membership[curr_leaves_mask] = curr
+            # membership indicates which parent node has that leaf as its child
 
             curr_leaves = np.where(curr_leaves_mask)[0]
             lchild_leaves = np.where(lchild_leaves_mask)[0]
             rchild_leaves = np.where(rchild_leaves_mask)[0]
 
-            prev_num_trellis_nodes = leaves_indptr.size - 1
+            prev_num_trellis_nodes = leaves_indptr.size - 1  # Initialized to number of leaves
             (lchild_node_id,
              leaves_indptr,
              leaves_indices) = get_trellis_node_id(
@@ -89,14 +102,16 @@ def build_trellis_from_trees(trees: np.ndarray):
              leaves_indptr,
              leaves_indices) = get_trellis_node_id(
                     leaves_indptr, leaves_indices, rchild_leaves)
-            assert lchild_node_id < prev_num_trellis_nodes
+            assert lchild_node_id < prev_num_trellis_nodes  # Because child should've been traversed
+                                                            # already so no new node should've been created
             assert rchild_node_id < prev_num_trellis_nodes
 
             (curr_node_id,
              leaves_indptr,
              leaves_indices) = get_trellis_node_id(
                     leaves_indptr, leaves_indices, curr_leaves)
-            assert curr_node_id <= prev_num_trellis_nodes
+            assert curr_node_id <= prev_num_trellis_nodes  # '=' if new trellis node created; < if already exists
+                                                           # because of another tree
 
             if curr_node_id == prev_num_trellis_nodes:
                 child_pairs_indptr = np.append(
@@ -107,17 +122,19 @@ def build_trellis_from_trees(trees: np.ndarray):
             else:
                 ptr = child_pairs_indptr[curr_node_id]
                 next_ptr = child_pairs_indptr[curr_node_id+1]
-                already_exists = False
+                already_exists = False  # Check if the current children pair are already stored for the trellis node
+                                        # since there can be more than one pair
                 for i in range(ptr, next_ptr, 2):
                     if child_pairs_indices[i] == lchild_node_id:
                         assert child_pairs_indices[i+1] == rchild_node_id
                         already_exists = True
                         break
                 if not already_exists:
-                    child_pairs_indptr[curr_node_id+1:] += 2
+                    child_pairs_indptr[curr_node_id+1:] += 2  # insert children pair at the end of existing list for
+                                                              # the trellis node, and push all elements after that too
                     child_pairs_indices = np.concatenate((
                             child_pairs_indices[:next_ptr],
-                            np.array(sorted([lchild_node_id, rchild_node_id]),
+                            np.array(sorted([lchild_node_id, rchild_node_id]),  # Q: Why sorted?
                                      dtype=np.int64),
                             child_pairs_indices[next_ptr:]
                     ))
@@ -161,6 +178,9 @@ class Trellis(object):
 
         # set topological order for internal trellis node iteration
         self.topo_order = np.argsort(np.diff(self.leaves_indptr))[self.n:]
+        """
+            gets trellis nodes in ascending order of number of leaves contained 
+        """
 
         # set some basic variables
         self.num_nodes = self.leaves_indptr.size - 1
