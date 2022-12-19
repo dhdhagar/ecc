@@ -104,6 +104,8 @@ class HACCutLayer(torch.nn.Module):
         for i in range(D - 1):
             max_node += 1
             min_minima_idx = torch.argmin(values).item()
+            # TODO: Can we merge more than one pair of clusters?
+            #    When there are non-overlapping pairs in (idx(values),indices), this should be possible
 
             # Merge the index of the minimum value of minimums across rows with the index of the minimum value in its row
             merge_idx_1 = min_minima_idx
@@ -152,7 +154,7 @@ class HACCutLayer(torch.nn.Module):
             merge_energy = torch.sum(weights[leaf_edges])
             if merge_energy >= energy[max_node]:
                 energy[max_node] = merge_energy
-                clustering[max_node][clustering[max_node] > 0] = max_node
+                clustering[max_node][leaf_indices] = max_node
                 round_matrix[leaf_edges] = 1
             if verbose:
                 print('Y:', Y)
